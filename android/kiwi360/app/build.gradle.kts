@@ -29,10 +29,15 @@ android {
         // Only debug builds let other apps (adb) start a game directly.
         manifestPlaceholders["emulatorExported"] = "false"
         // The recommended settings server; -PaiConfigUrl=http://... points a test build at a
-        // mock, and only then is cleartext allowed.
+        // mock, and only then (or with an http -PupdateUrl) is cleartext allowed.
         val aiConfigUrl = (project.findProperty("aiConfigUrl") as String?) ?: "https://ai.lemon-emu.org/v1"
         buildConfigField("String", "AI_CONFIG_URL", "\"$aiConfigUrl\"")
-        manifestPlaceholders["cleartextAllowed"] = aiConfigUrl.startsWith("http://").toString()
+        // The in-app updater asks the project's releases (Updater.kt); -PupdateUrl=http://...
+        // replaces them with one releases list from a mock, and then debug builds check too.
+        val updateUrl = (project.findProperty("updateUrl") as String?).orEmpty()
+        buildConfigField("String", "UPDATE_URL", "\"$updateUrl\"")
+        manifestPlaceholders["cleartextAllowed"] =
+            (aiConfigUrl.startsWith("http://") || updateUrl.startsWith("http://")).toString()
     }
 
     buildTypes {

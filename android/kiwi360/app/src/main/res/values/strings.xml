@@ -434,4 +434,29 @@
     <string name="fxp_zoom">Zoom</string>
     <string name="fxp_pixel_size">Pixel size</string>
     <string name="fxp_sepia">Sepia</string>
+    <!-- In-app updater (Updater.kt, UpdateScreens.kt) -->
+    <string name="updates_title">Updates</string>
+    <string name="updates_tile_desc">Version %1$s</string>
+    <string name="update_title">Update available</string>
+    <string name="update_versions">Kiwi360 %1$s is available. You have %2$s.</string>
+    <string name="update_no_notes">This release has no notes.</string>
+    <string name="update_download">Download and install</string>
+    <string name="update_skip">Skip this version</string>
+    <string name="update_later">Later</string>
+    <string name="update_install">Install</string>
+    <string name="update_retry">Retry</string>
+    <string name="update_downloading">Downloading… %1$d%%</string>
+    <string name="update_permission">Allow Kiwi360 to install apps in the screen that opened, then come back.</string>
+    <string name="update_error_download">The download failed. Check your connection.</string>
+    <string name="update_error_install">The installer could not be opened.</string>
+    <string name="update_error_permission">Kiwi360 is not allowed to install apps.</string>
+    <string name="update_error_check">Could not check for updates. Check your connection.</string>
+    <string name="update_installed_version">Installed version: %1$s</string>
+    <string name="update_checks">Check for updates</string>
+    <string name="update_checks_desc">When Kiwi360 starts</string>
+    <string name="update_check_now">Check now</string>
+    <string name="update_check_now_desc">Look for a newer version</string>
+    <string name="update_checking">Checking…</string>
+    <string name="update_up_to_date">You have the latest version</string>
+    <string name="update_dev_build">Development builds don’t update themselves</string>
 </resources>

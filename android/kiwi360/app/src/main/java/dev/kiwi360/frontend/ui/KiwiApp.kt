@@ -96,6 +96,8 @@ import dev.kiwi360.frontend.library.InstalledContent
 import dev.kiwi360.frontend.library.Library
 import dev.kiwi360.frontend.library.PlayTime
 import dev.kiwi360.frontend.settings.ConsoleLanguage
+import dev.kiwi360.frontend.update.Release
+import dev.kiwi360.frontend.update.Updater
 import androidx.annotation.StringRes
 import jp.xenia.emulator.R
 import kotlinx.coroutines.Dispatchers
@@ -125,6 +127,8 @@ class AppState(val library: Library, val drivers: GpuDriverStore) {
     var driverRevision by mutableIntStateOf(0)
     /** Set when another app opened a game's options: Back there returns to that app. */
     var returnToCaller: (() -> Unit)? = null
+    /** A newer release found at start, offered once the dashboard is showing. */
+    var pendingUpdate by mutableStateOf<Release?>(null)
 
     fun updateFolders(value: Set<String>) {
         library.folders = value
@@ -169,6 +173,12 @@ sealed interface Screen {
      * when a game is started. Closing returns to [back].
      */
     data class UnsupportedCpu(val back: Screen, val notice: Boolean = false) : Screen
+
+    /** A newer release: download and install it, skip it or leave it for later; closing returns to [back]. */
+    data class Update(val release: Release, val back: Screen) : Screen
+
+    /** Settings, Updates: the check at start, a check now and the installed version. */
+    data object Updates : Screen
 }
 
 @Composable
@@ -188,6 +198,19 @@ fun KiwiApp(state: AppState, onLaunch: (Game, GameFile) -> Unit) {
     LaunchedEffect(state.resumeTick) {
         if (state.resumeTick > 0 && state.games.isNotEmpty()) {
             state.games = withContext(Dispatchers.IO) { state.library.refresh(state.games) }
+        }
+    }
+    // Release builds look for a newer version once per app start, in the background.
+    val context = LocalContext.current
+    LaunchedEffect(Unit) {
+        Updater.checkAtStart(context.applicationContext)?.let { state.pendingUpdate = it }
+    }
+    // Offered over the dashboard only, never over a notice or a screen the player is in.
+    LaunchedEffect(state.pendingUpdate, state.screen) {
+        val release = state.pendingUpdate ?: return@LaunchedEffect
+        if (state.screen == Screen.Dashboard) {
+            state.pendingUpdate = null
+            state.screen = Screen.Update(release, Screen.Dashboard)
         }
     }
     MetroBackground {
@@ -217,6 +240,8 @@ fun KiwiApp(state: AppState, onLaunch: (Game, GameFile) -> Unit) {
                 ?: LaunchedEffect(Unit) { state.screen = Screen.Dashboard }
             is Screen.AiReverted -> AiRevertedScreen(state, screen.notices, onLaunch)
             is Screen.UnsupportedCpu -> UnsupportedCpuScreen(state, screen.back, screen.notice)
+            is Screen.Update -> UpdateScreen(state, screen.release, screen.back)
+            Screen.Updates -> UpdatesScreen(state)
             is Screen.PostEffects -> if (screen.key == null) {
                 PostEffectsScreen(null) { state.screen = Screen.GlobalOptions }
             } else {
@@ -532,6 +557,13 @@ private fun SettingsPivot(state: AppState, unit: Dp) {
                     }
                 }
             }
+        }
+        item {
+            ActionTile(
+                stringResource(R.string.updates_title), stringResource(R.string.updates_tile_desc, Updater.installedVersion),
+                unit * 1.5f, unit * 2 + TILE_GAP, Kiwi.Slate,
+                focusRequester = focusOf("settings:updates"), onFocused = { state.focusKey = "settings:updates" },
+            ) { state.screen = Screen.Updates }
         }
         item {
             ActionTile(

@@ -129,7 +129,7 @@ internal fun GlobalOptionsScreen(state: AppState) {
 }
 
 @Composable
-private fun OptionRow(
+internal fun OptionRow(
     title: String,
     detail: String?,
     value: String,

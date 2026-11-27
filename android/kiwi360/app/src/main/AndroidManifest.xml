@@ -9,6 +9,8 @@
         android:version="0x401000" />
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- The in-app updater opens the system installer on a downloaded release APK. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- Reading a title's saves as a ZIP (library provider, save_zip/): only Kiwi360
          itself holds it. Other apps get a one-time grant through EXPORT_SAVES. -->
@@ -145,6 +147,18 @@
             <meta-data
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/shared_logs_paths" />
+        </provider>
+
+        <!-- Hands a downloaded update APK (cache/updates) to the system installer. Its own
+             FileProvider subclass: two providers can't share one class name. -->
+        <provider
+            android:name="dev.kiwi360.frontend.update.UpdateFileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_paths" />
         </provider>
 
     </application>
