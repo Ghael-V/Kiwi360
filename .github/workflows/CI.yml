@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+      - 'LICENSE'
+  pull_request:
+    # ready_for_review is what starts the pipeline for a PR that was opened as
+    # a draft, since the build job below skips while it stays one.
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+      - 'LICENSE'
+  workflow_dispatch:
+
+# No workflow-level `permissions:` block; each job declares its own minimum
+# set explicitly. Workflow-level restrictions can cap job-level overrides in
+# ways that break release creation, so this keeps the release job's
+# `contents: write` intact.
+
+jobs:
+  # Reserves the release number up front so the builds can bake it in. Only edge
+  # pushes get one, everything else builds with an empty version.
+  version:
+    name: Version
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.reserve.outputs.version }}
+    steps:
+      - name: Reserve release number
+        id: reserve
+        if: |
+          github.repository == 'has207/xenia-edge' &&
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/edge'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          refs=$(git ls-remote --tags "https://github.com/${GH_REPO}")
+          # A full re-run keeps the number this commit already has.
+          tag=$(printf '%s\n' "$refs" | sed -n "s|^${GITHUB_SHA}\trefs/tags/\([0-9]\{8\}\.[0-9]\+\)$|\1|p" | head -n1)
+          # UTC date plus a per-day counter from 0, e.g. 20261125.0
+          day=$(date -u +%Y%m%d)
+          n=$(printf '%s\n' "$refs" | sed -n "s|.*\trefs/tags/${day}\.\([0-9]\+\)$|\1|p" | sort -n | tail -n1)
+          n=${n:--1}
+          # Creating a ref fails if it exists, so a concurrent run moves on to the next number.
+          for attempt in 1 2 3 4 5; do
+            [ -n "$tag" ] && break
+            n=$((n + 1))
+            if gh api "repos/${GH_REPO}/git/refs" -f ref="refs/tags/${day}.${n}" -f sha="$GITHUB_SHA" > /dev/null; then
+              tag="${day}.${n}"
+            fi
+          done
+          if [ -z "$tag" ]; then
+            echo "::error::Could not reserve a release number"
+            exit 1
+          fi
+          echo "Version: $tag"
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+  # One build job for every ref, each granted `actions: write` so any branch can
+  # populate the sccache cache. Cache writes cover only third_party (stable
+  # across branches), keeping per-branch entries small and isolated. Fork PRs
+  # get a read-only token from GitHub regardless, so sccache self-demotes to
+  # read-only on its startup write probe.
+  build:
+    name: Build
+    needs: version
+    # Draft PRs don't need the pipeline. Marking one ready re-triggers it.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.draft == false
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+
+  release:
+    name: Create Release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: needs.version.outputs.version != ''
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: xenia_edge_linux
+          path: linux_artifacts
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: xenia_edge_windows
+          path: windows_artifacts
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: xenia_edge_macos
+          path: macos_artifacts
+
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.version }}
+        run: |
+          tag=$TAG
+
+          cd linux_artifacts
+          # For Linux, just rename the AppImage (no need to zip a single file)
+          mv xenia_edge.AppImage ../xenia_edge_${tag}_linux.AppImage
+          cd ../windows_artifacts
+          7z a ../xenia_edge_${tag}_windows.zip * -xr!'*.pdb' -mx9 -bb3
+          cd ../macos_artifacts
+          # macOS DMG is already a single distributable file; just hoist it.
+          mv xenia_edge_macos.dmg ../xenia_edge_${tag}_macos.dmg
+          cd ..
+
+          # Build release body: commit list since last release + compare URL
+          prev_tag=$(gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || echo "")
+          prev_sha=""
+          if [ -n "$prev_tag" ]; then
+            prev_sha=$(git rev-parse "${prev_tag}^{}" 2>/dev/null || git rev-parse "$prev_tag" 2>/dev/null || echo "")
+          fi
+          {
+            if [ -n "$prev_sha" ]; then
+              echo "### Changes"
+              echo ""
+              git log --format="- %s (\`%h\`)" --abbrev=7 "${prev_sha}..${GITHUB_SHA}" --
+              echo ""
+              echo "**Full changelog**: https://github.com/${GH_REPO}/compare/${prev_tag}...${tag}"
+            else
+              echo "### Changes"
+              echo ""
+              git log --format="- %s (\`%h\`)" --abbrev=7 -1 "${GITHUB_SHA}" --
+            fi
+          } > release_notes.md
+
+          # Create release
+          gh release create $tag --verify-tag \
+            xenia_edge_${tag}_linux.AppImage xenia_edge_${tag}_windows.zip \
+            xenia_edge_${tag}_macos.dmg \
+            -t "xenia_edge $tag" --notes-file release_notes.md

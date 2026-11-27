@@ -1,0 +1,2303 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+#include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
+
+#include <algorithm>
+#include <atomic>
+#include <utility>
+#include <vector>
+
+#include "xenia/base/atomic.h"
+#include "xenia/base/clock.h"
+#include "xenia/base/math.h"
+#include "xenia/base/platform.h"
+#include "xenia/base/profiling.h"
+#include "xenia/cpu/processor.h"
+#include "xenia/kernel/guest_scheduler.h"
+#include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
+#include "xenia/kernel/xsemaphore.h"
+#include "xenia/kernel/xthread.h"
+#include "xenia/kernel/xtimer.h"
+#include "xenia/xbox.h"
+
+namespace xe {
+namespace kernel {
+namespace xboxkrnl {
+
+// r13 + 0x100: pointer to thread local state
+// Thread local state:
+//   0x058: kernel time
+//   0x14C: thread id
+//   0x150: if >0 then error states don't get set
+//   0x160: last error
+
+// GetCurrentThreadId:
+// lwz       r11, 0x100(r13)
+// lwz       r3, 0x14C(r11)
+
+// RtlGetLastError:
+// lwz r11, 0x150(r13)
+// if (r11 == 0) {
+//   lwz r11, 0x100(r13)
+//   stw r3, 0x160(r11)
+// }
+
+// RtlSetLastError:
+// lwz r11, 0x150(r13)
+// if (r11 == 0) {
+//   lwz r11, 0x100(r13)
+//   stw r3, 0x160(r11)
+// }
+
+// RtlSetLastNTError:
+// r3 = RtlNtStatusToDosError(r3)
+// lwz r11, 0x150(r13)
+// if (r11 == 0) {
+//   lwz r11, 0x100(r13)
+//   stw r3, 0x160(r11)
+// }
+
+// A NtCreate* call on a name in use opens the object only with OBJ_OPENIF and
+// the same type, returning X_STATUS_OBJECT_NAME_EXISTS. Otherwise it fails with
+// a collision, or a type mismatch under OBJ_OPENIF, and writes handle 0.
+// X_STATUS_SUCCESS means the name is free to create.
+template <typename T>
+X_STATUS OpenNamedObject(KernelState* kernel_state, uint32_t obj_attributes_ptr,
+                         xe::be<uint32_t>* handle_ptr) {
+  constexpr uint32_t kObjOpenIf = 0x80;
+  if (!obj_attributes_ptr) {
+    return X_STATUS_SUCCESS;
+  }
+  auto obj_attributes =
+      kernel_state->memory()->TranslateVirtual<X_OBJECT_ATTRIBUTES*>(
+          obj_attributes_ptr);
+  assert_true(obj_attributes->name_ptr != 0);
+  auto name = util::TranslateAnsiStringAddress(kernel_state->memory(),
+                                               obj_attributes->name_ptr);
+  if (name.empty()) {
+    return X_STATUS_SUCCESS;
+  }
+  auto object_table = kernel_state->object_table();
+  X_HANDLE handle = X_INVALID_HANDLE_VALUE;
+  if (XFAILED(object_table->GetObjectByName(name, &handle))) {
+    return X_STATUS_SUCCESS;
+  }
+  const bool open_if = obj_attributes->attributes & kObjOpenIf;
+  auto object = object_table->LookupObject<XObject>(handle);
+  if (object && open_if && object->type() == T::kObjectType) {
+    // The lookup's handle reference is the caller's.
+    if (handle_ptr) {
+      *handle_ptr = handle;
+    } else {
+      object_table->ReleaseHandle(handle);
+    }
+    return X_STATUS_OBJECT_NAME_EXISTS;
+  }
+  object_table->ReleaseHandle(handle);
+  if (!object) {
+    return X_STATUS_SUCCESS;
+  }
+  if (handle_ptr) {
+    *handle_ptr = 0;
+  }
+  return open_if ? X_STATUS_OBJECT_TYPE_MISMATCH
+                 : X_STATUS_OBJECT_NAME_COLLISION;
+}
+
+inline const std::map<uint32_t, std::string> ex_thread_flag_map = {
+    {ThreadInitiallySuspended, "Thread Initially Suspended"},
+    {SystemThread, "Guest Created System Thread"},
+    {TLSStatic, "TLS Static"},
+    {PriorityClass1, "Thread Priority Class 1"},
+    {PriorityClass2, "Thread Priority Class 2"},
+    {ReturnKThreadPtr, "Return Kthread Ptr"},
+    {TitleExecutionThread, "Title Execution Thread"},
+    {Hidden, "Hide From Debug List"},
+    {AffinityCpu0, "Thread Starts At Cpu 1"},
+    {AffinityCpu1, "Thread Starts At Cpu 2"},
+    {AffinityCpu2, "Thread Starts At Cpu 3"},
+    {AffinityCpu3, "Thread Starts At Cpu 4"},
+    {AffinityCpu4, "Thread Starts At Cpu 5"},
+    {AffinityCpu5, "Thread Starts At Cpu 6"}};
+
+uint32_t ExCreateThread(xe::be<uint32_t>* handle_ptr, uint32_t stack_size,
+                        xe::be<uint32_t>* thread_id_ptr,
+                        uint32_t xapi_thread_startup, uint32_t start_address,
+                        uint32_t start_context, uint32_t creation_flags) {
+  // Invalid Link
+  // http://jafile.com/uploads/scoop/main.cpp.txt
+  // DWORD
+  // LPHANDLE Handle,
+  // DWORD    StackSize,
+  // LPDWORD  ThreadId,
+  // LPVOID   XapiThreadStartup, ?? often 0
+  // LPVOID   StartAddress,
+  // LPVOID   StartContext,
+  // DWORD    CreationFlags // 0x80?
+
+  std::string summary = "ExCreateThread Active:";
+  uint32_t unused_flag = creation_flags;
+
+  for (const auto& entry : ex_thread_flag_map) {
+    if (creation_flags & entry.first) {
+      summary += fmt::format(" {},", entry.second);
+      unused_flag &= ~entry.first;
+    }
+  }
+  if (unused_flag) {
+    summary += fmt::format(" Unk flag: {:08X}", unused_flag);
+  }
+  XELOGD("{}", summary);
+
+  uint32_t thread_process = (creation_flags & SystemThread)
+                                ? kernel_state()->GetSystemProcess()
+                                : kernel_state()->GetTitleProcess();
+  X_KPROCESS* target_process =
+      kernel_state()->memory()->TranslateVirtual<X_KPROCESS*>(thread_process);
+  // Inherit default stack size
+  uint32_t actual_stack_size = stack_size;
+
+  if (actual_stack_size == 0) {
+    actual_stack_size = target_process->kernel_stack_size;
+  }
+
+  // Stack must be aligned to 16kb pages
+  actual_stack_size =
+      std::max((uint32_t)0x4000, ((actual_stack_size + 0xFFF) & 0xFFFFF000));
+
+  auto thread = object_ref<XThread>(new XThread(
+      kernel_state(), actual_stack_size, xapi_thread_startup, start_address,
+      start_context, creation_flags, true, false, thread_process));
+
+  X_STATUS result = thread->Create();
+  if (XFAILED(result)) {
+    // Failed!
+    XELOGE("Thread creation failed: {:08X}", result);
+    return result;
+  }
+
+  if (XSUCCEEDED(result)) {
+    if (handle_ptr) {
+      if (creation_flags & ReturnKThreadPtr) {
+        *handle_ptr = thread->guest_object();
+      } else {
+        *handle_ptr = thread->handle();
+      }
+    }
+    if (thread_id_ptr) {
+      *thread_id_ptr = thread->thread_id();
+    }
+  }
+  return result;
+}
+
+dword_result_t ExCreateThread_entry(lpdword_t handle_ptr, dword_t stack_size,
+                                    lpdword_t thread_id_ptr,
+                                    dword_t xapi_thread_startup,
+                                    lpvoid_t start_address,
+                                    lpvoid_t start_context,
+                                    dword_t creation_flags) {
+  return ExCreateThread(handle_ptr, stack_size, thread_id_ptr,
+                        xapi_thread_startup, start_address, start_context,
+                        creation_flags);
+}
+DECLARE_XBOXKRNL_EXPORT1(ExCreateThread, kThreading, kImplemented);
+
+uint32_t ExTerminateThread(uint32_t exit_code) {
+  XThread* thread = XThread::GetCurrentThread();
+
+  // NOTE: this kills us right now. We won't return from it.
+  return thread->Exit(exit_code);
+}
+
+dword_result_t ExTerminateThread_entry(dword_t exit_code) {
+  return ExTerminateThread(exit_code);
+}
+DECLARE_XBOXKRNL_EXPORT1(ExTerminateThread, kThreading, kImplemented);
+
+uint32_t NtResumeThread(uint32_t handle, uint32_t* suspend_count_ptr) {
+  X_RESULT result = X_STATUS_INVALID_HANDLE;
+  uint32_t suspend_count = 0;
+
+  auto thread = kernel_state()->object_table()->LookupObject<XThread>(handle);
+
+  if (thread) {
+    if (thread->type() == XObject::Type::Thread) {
+      result = thread->Resume(&suspend_count);
+    } else {
+      return X_STATUS_OBJECT_TYPE_MISMATCH;
+    }
+  } else {
+    return X_STATUS_INVALID_HANDLE;
+  }
+  if (suspend_count_ptr) {
+    *suspend_count_ptr = suspend_count;
+  }
+
+  return result;
+}
+
+dword_result_t NtResumeThread_entry(dword_t handle,
+                                    lpdword_t suspend_count_ptr) {
+  SCOPE_profile_cpu_i("guestsync", "NtResumeThread");
+  uint32_t suspend_count =
+      suspend_count_ptr ? static_cast<uint32_t>(*suspend_count_ptr) : 0u;
+
+  const X_RESULT result =
+      NtResumeThread(handle, suspend_count_ptr ? &suspend_count : nullptr);
+
+  if (suspend_count_ptr) {
+    *suspend_count_ptr = suspend_count;
+  }
+
+  return result;
+}
+DECLARE_XBOXKRNL_EXPORT1(NtResumeThread, kThreading, kImplemented);
+
+// Returns the suspend count from before the resume.
+dword_result_t KeResumeThread_entry(pointer_t<X_KTHREAD> thread_ptr) {
+  uint32_t previous_suspend_count = 0;
+  auto thread = XObject::GetNativeObject<XThread>(kernel_state(), thread_ptr,
+                                                  ThreadObject);
+  if (thread) {
+    thread->Resume(&previous_suspend_count);
+  }
+
+  return previous_suspend_count;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeResumeThread, kThreading, kImplemented);
+
+dword_result_t NtSuspendThread_entry(dword_t handle,
+                                     lpdword_t suspend_count_ptr,
+                                     const ppc_context_t& context) {
+  SCOPE_profile_cpu_i("guestsync", "NtSuspendThread");
+  X_RESULT result = X_STATUS_SUCCESS;
+  uint32_t suspend_count = 0;
+
+  auto thread = kernel_state()->object_table()->LookupObject<XThread>(handle);
+  if (thread) {
+    if (thread->type() == XObject::Type::Thread) {
+      auto current_pcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
+
+#if XE_PLATFORM_WIN32
+      if (current_pcr->prcb_data.current_thread == thread->guest_object() ||
+          !thread->guest_object<X_KTHREAD>()->terminated) {
+        result = thread->Suspend(&suspend_count);
+      } else {
+        return X_STATUS_THREAD_IS_TERMINATING;
+      }
+#else
+      // Handle self-suspension specially to avoid deadlock.
+      if (!thread->guest_object<X_KTHREAD>()->terminated) {
+        bool is_self_suspend =
+            (current_pcr->prcb_data.current_thread == thread->guest_object());
+
+        if (is_self_suspend) {
+          XELOGD("Thread {:X} self-suspending", thread->handle());
+          result = thread->SelfSuspend(&suspend_count);
+          XELOGD("Thread {:X} resumed", thread->handle());
+        } else {
+          result = thread->Suspend(&suspend_count);
+        }
+      } else {
+        return X_STATUS_THREAD_IS_TERMINATING;
+      }
+#endif
+    } else {
+      return X_STATUS_OBJECT_TYPE_MISMATCH;
+    }
+  } else {
+    return X_STATUS_INVALID_HANDLE;
+  }
+
+  // A failed suspend leaves the count unwritten.
+  if (suspend_count_ptr && XSUCCEEDED(result)) {
+    *suspend_count_ptr = suspend_count;
+  }
+
+  return result;
+}
+DECLARE_XBOXKRNL_EXPORT1(NtSuspendThread, kThreading, kImplemented);
+
+dword_result_t KeSuspendThread_entry(pointer_t<X_KTHREAD> kthread,
+                                     const ppc_context_t& context) {
+  auto thread = XObject::GetNativeObject<XThread>(context->kernel_state,
+                                                  kthread, ThreadObject);
+  uint32_t suspend_count_out = 0;
+
+  if (thread) {
+    suspend_count_out = thread->suspend_count();
+
+    uint32_t discarded_new_suspend_count = 0;
+    thread->Suspend(&discarded_new_suspend_count);
+  }
+
+  return suspend_count_out;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSuspendThread, kThreading, kImplemented);
+
+void KeSetCurrentStackPointers_entry(lpvoid_t stack_ptr,
+                                     pointer_t<X_KTHREAD> thread,
+                                     lpvoid_t stack_alloc_base,
+                                     lpvoid_t stack_base, lpvoid_t stack_limit,
+                                     const ppc_context_t& context) {
+  auto current_thread = XThread::GetCurrentThread();
+
+  auto pcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
+  // also supposed to load msr mask, and the current msr with that, and store
+  thread->stack_alloc_base = stack_alloc_base.value();
+  thread->stack_base = stack_base.value();
+  thread->stack_limit = stack_limit.value();
+  pcr->stack_base_ptr = stack_base.guest_address();
+  pcr->stack_end_ptr = stack_limit.guest_address();
+  context->r[1] = stack_ptr.guest_address();
+
+  // If a fiber is set, and the thread matches, reenter to avoid issues with
+  // host stack overflowing.
+  if (thread->fiber_ptr &&
+      current_thread->guest_object() == thread.guest_address()) {
+    context->processor->backend()->PrepareForReentry(context.value());
+    current_thread->Reenter(static_cast<uint32_t>(context->lr));
+  }
+}
+DECLARE_XBOXKRNL_EXPORT2(KeSetCurrentStackPointers, kThreading, kImplemented,
+                         kHighFrequency);
+
+dword_result_t KeSetAffinityThread_entry(pointer_t<X_KTHREAD> thread_ptr,
+                                         dword_t affinity,
+                                         lpdword_t previous_affinity_ptr) {
+  // The Xbox 360, according to disassembly of KeSetAffinityThread, unlike
+  // Windows NT, stores the previous affinity via the pointer provided as an
+  // argument, not in the return value - the return value is used for the
+  // result.
+  if (!affinity) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  auto thread = XObject::GetNativeObject<XThread>(kernel_state(), thread_ptr,
+                                                  ThreadObject);
+  if (!thread) {
+    XELOGW(
+        "KeSetAffinityThread: guest thread pointer {:08X} did not resolve to "
+        "an XThread; returning STATUS_INVALID_HANDLE",
+        thread_ptr.guest_address());
+    return X_STATUS_INVALID_HANDLE;
+  }
+  if (previous_affinity_ptr) {
+    *previous_affinity_ptr = uint32_t(1) << thread->active_cpu();
+  }
+  thread->SetAffinity(affinity);
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSetAffinityThread, kThreading, kImplemented);
+
+dword_result_t KeQueryBasePriorityThread_entry(
+    pointer_t<X_KTHREAD> thread_ptr) {
+  int32_t priority = 0;
+
+  auto thread = XObject::GetNativeObject<XThread>(kernel_state(), thread_ptr,
+                                                  ThreadObject);
+  if (thread) {
+    priority = thread->QueryBasePriority();
+  }
+
+  return priority;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeQueryBasePriorityThread, kThreading, kImplemented);
+
+dword_result_t KeQueryBackgroundProcessors_entry() {
+  return kernel_state()->GetBackgroundProcessors();
+}
+DECLARE_XBOXKRNL_EXPORT1(KeQueryBackgroundProcessors, kThreading, kImplemented);
+
+void KeSetBackgroundProcessors_entry(dword_t value) {
+  kernel_state()->SetBackgroundProcessors(value);
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSetBackgroundProcessors, kThreading, kImplemented);
+
+dword_result_t KeSetBasePriorityThread_entry(pointer_t<X_KTHREAD> thread_ptr,
+                                             dword_t increment) {
+  int32_t prev_priority = 0;
+  auto thread = XObject::GetNativeObject<XThread>(kernel_state(), thread_ptr,
+                                                  ThreadObject);
+
+  if (thread) {
+    prev_priority = thread->SetBasePriority(static_cast<int32_t>(increment));
+  }
+
+  return prev_priority;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSetBasePriorityThread, kThreading, kImplemented);
+
+dword_result_t KeSetDisableBoostThread_entry(pointer_t<X_KTHREAD> thread_ptr,
+                                             dword_t disabled) {
+  // supposed to acquire dispatcher lock + a prcb lock, all just to exchange
+  // this char there is no other special behavior going on in this function,
+  // just acquiring locks to do this exchange
+  auto old_boost_disabled =
+      reinterpret_cast<std::atomic_uint8_t*>(&thread_ptr->boost_disabled)
+          ->exchange(static_cast<uint8_t>(disabled));
+
+  return old_boost_disabled;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSetDisableBoostThread, kThreading, kImplemented);
+
+uint32_t xeKeGetCurrentProcessType(cpu::ppc::PPCContext* context) {
+  auto pcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
+
+  if (!pcr->prcb_data.dpc_active) {
+    return context->TranslateVirtual(pcr->prcb_data.current_thread)
+        ->process_type;
+  }
+  return pcr->processtype_value_in_dpc;
+}
+void xeKeSetCurrentProcessType(uint32_t type, cpu::ppc::PPCContext* context) {
+  auto pcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
+  if (pcr->prcb_data.dpc_active) {
+    pcr->processtype_value_in_dpc = type;
+  }
+}
+
+dword_result_t KeGetCurrentProcessType_entry(const ppc_context_t& context) {
+  return xeKeGetCurrentProcessType(context);
+}
+DECLARE_XBOXKRNL_EXPORT2(KeGetCurrentProcessType, kThreading, kImplemented,
+                         kHighFrequency);
+
+void KeSetCurrentProcessType_entry(dword_t type, const ppc_context_t& context) {
+  xeKeSetCurrentProcessType(type, context);
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSetCurrentProcessType, kThreading, kImplemented);
+
+dword_result_t KeQueryPerformanceFrequency_entry() {
+  uint64_t result = Clock::guest_tick_frequency();
+  return static_cast<uint32_t>(result);
+}
+DECLARE_XBOXKRNL_EXPORT2(KeQueryPerformanceFrequency, kThreading, kImplemented,
+                         kHighFrequency);
+
+uint32_t KeDelayExecutionThread(uint32_t processor_mode, uint32_t alertable,
+                                uint64_t* interval_ptr,
+                                cpu::ppc::PPCContext* ctx) {
+  XThread* thread = XThread::GetCurrentThread();
+
+  xeProcessKernelApcs(ctx);
+  if (alertable) {
+    X_STATUS stat = xeProcessUserApcs(ctx);
+    if (stat == X_STATUS_USER_APC) {
+      return stat;
+    }
+  }
+  X_STATUS result = thread->Delay(processor_mode, alertable, *interval_ptr);
+  // One queued as the delay ended runs on the way out.
+  xeProcessKernelApcs(ctx);
+
+  if (result == X_STATUS_USER_APC) {
+    xeProcessUserApcs(ctx);
+  }
+
+  return result;
+}
+
+dword_result_t KeDelayExecutionThread_entry(dword_t processor_mode,
+                                            dword_t alertable,
+                                            lpqword_t interval_ptr,
+                                            const ppc_context_t& context) {
+  SCOPE_profile_cpu_i("guestsync", "KeDelayExecutionThread");
+  // The kernel reads the interval unconditionally, so a null one faults on the
+  // console. Yield rather than crash the host.
+  uint64_t interval = interval_ptr ? static_cast<uint64_t>(*interval_ptr) : 0u;
+  return KeDelayExecutionThread(processor_mode, alertable, &interval, context);
+}
+DECLARE_XBOXKRNL_EXPORT3(KeDelayExecutionThread, kThreading, kImplemented,
+                         kBlocking, kHighFrequency);
+
+dword_result_t NtYieldExecution_entry() {
+  SCOPE_profile_cpu_i("guestsync", "NtYieldExecution");
+  xeProcessKernelApcs(nullptr);
+  if (GuestScheduler::enabled() && XThread::GetCurrentFiberThread()) {
+    // NT reports whether anything else ran. Guests fall back to an alertable
+    // sleep on no-yield, which is where their pending APCs get pumped.
+    if (!kernel_state()->guest_scheduler()->YieldExecution(true)) {
+      return X_STATUS_NO_YIELD_PERFORMED;
+    }
+  } else {
+    xe::threading::MaybeYield();
+  }
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT2(NtYieldExecution, kThreading, kImplemented,
+                         kHighFrequency);
+
+void KeQuerySystemTime_entry(lpqword_t time_ptr, const ppc_context_t& ctx) {
+  if (time_ptr) {
+    // update the timestamp bundle to the time we queried.
+    // this is a race, but i don't of any sw that requires it, it just seems
+    // like we ought to keep it consistent with ketimestampbundle in case
+    // something uses this function, but also reads it directly
+    uint32_t ts_bundle = ctx->kernel_state->GetKeTimestampBundle();
+    uint64_t time = Clock::QueryGuestSystemTime();
+    // todo: cmpxchg?
+    xe::store_and_swap<uint64_t>(
+        &ctx->TranslateVirtual<X_TIME_STAMP_BUNDLE*>(ts_bundle)->system_time,
+        time);
+    *time_ptr = time;
+  }
+}
+DECLARE_XBOXKRNL_EXPORT1(KeQuerySystemTime, kThreading, kImplemented);
+
+// https://msdn.microsoft.com/en-us/library/ms686801
+dword_result_t KeTlsAlloc_entry(const ppc_context_t& context) {
+  uint32_t slot = kernel_state()->AllocateTLS(context);
+  XThread::GetCurrentThread()->SetTLSValue(slot, 0);
+
+  return slot;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeTlsAlloc, kThreading, kImplemented);
+
+// https://msdn.microsoft.com/en-us/library/ms686804
+dword_result_t KeTlsFree_entry(dword_t tls_index,
+                               const ppc_context_t& context) {
+  if (tls_index == X_TLS_OUT_OF_INDEXES) {
+    return 0;
+  }
+
+  kernel_state()->FreeTLS(context, tls_index);
+  return 1;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeTlsFree, kThreading, kImplemented);
+
+// https://msdn.microsoft.com/en-us/library/ms686812
+dword_result_t KeTlsGetValue_entry(dword_t tls_index) {
+  // xboxkrnl doesn't actually have an error branch - it always succeeds, even
+  // if it overflows the TLS.
+  uint32_t value = 0;
+  if (XThread::GetCurrentThread()->GetTLSValue(tls_index, &value)) {
+    return value;
+  }
+
+  return 0;
+}
+DECLARE_XBOXKRNL_EXPORT2(KeTlsGetValue, kThreading, kImplemented,
+                         kHighFrequency);
+
+// https://msdn.microsoft.com/en-us/library/ms686818
+dword_result_t KeTlsSetValue_entry(dword_t tls_index, dword_t tls_value) {
+  // xboxkrnl doesn't actually have an error branch - it always succeeds, even
+  // if it overflows the TLS.
+  if (XThread::GetCurrentThread()->SetTLSValue(tls_index, tls_value)) {
+    return 1;
+  }
+
+  return 0;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeTlsSetValue, kThreading, kImplemented);
+
+void KeInitializeEvent_entry(pointer_t<X_KEVENT> event_ptr, dword_t event_type,
+                             dword_t initial_state) {
+  event_ptr.Zero();
+  event_ptr->header.type = static_cast<X_OBJECT_TYPES>(event_type.value());
+  event_ptr->header.signal_state = initial_state.value();
+  auto ev = XObject::GetNativeObject<XEvent>(kernel_state(), event_ptr,
+                                             event_ptr->header.type);
+  if (!ev) {
+    assert_always();
+    return;
+  }
+}
+DECLARE_XBOXKRNL_EXPORT1(KeInitializeEvent, kThreading, kImplemented);
+
+uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
+  int32_t old_signal_state;
+  if (XObject::TrySetUnwrappedEvent(kernel_state(), event_ptr,
+                                    &old_signal_state)) {
+    return old_signal_state;
+  }
+  auto ev = XObject::GetNativeObject<XEvent>(kernel_state(), event_ptr,
+                                             event_ptr->header.type);
+  if (!ev) {
+    assert_always();
+    return 0;
+  }
+
+  return ev->Set(increment, !!wait);
+}
+
+dword_result_t KeSetEvent_entry(pointer_t<X_KEVENT> event_ptr,
+                                dword_t increment, dword_t wait) {
+  return xeKeSetEvent(event_ptr, increment, wait);
+}
+DECLARE_XBOXKRNL_EXPORT2(KeSetEvent, kThreading, kImplemented, kHighFrequency);
+
+dword_result_t KePulseEvent_entry(pointer_t<X_KEVENT> event_ptr,
+                                  dword_t increment, dword_t wait) {
+  auto ev = XObject::GetNativeObject<XEvent>(kernel_state(), event_ptr,
+                                             event_ptr->header.type);
+  if (!ev) {
+    assert_always();
+    return 0;
+  }
+
+  return ev->Pulse(increment, !!wait);
+}
+DECLARE_XBOXKRNL_EXPORT2(KePulseEvent, kThreading, kImplemented,
+                         kHighFrequency);
+
+dword_result_t KeResetEvent_entry(pointer_t<X_KEVENT> event_ptr) {
+  auto ev = XObject::GetNativeObject<XEvent>(kernel_state(), event_ptr,
+                                             event_ptr->header.type);
+  if (!ev) {
+    assert_always();
+    return 0;
+  }
+
+  return ev->Reset();
+}
+DECLARE_XBOXKRNL_EXPORT1(KeResetEvent, kThreading, kImplemented);
+
+dword_result_t NtCreateEvent_entry(
+    lpdword_t handle_ptr, pointer_t<X_OBJECT_ATTRIBUTES> obj_attributes_ptr,
+    dword_t event_type, dword_t initial_state) {
+  // Check for an existing timer with the same name.
+  if (X_STATUS result = OpenNamedObject<XEvent>(kernel_state(),
+                                                obj_attributes_ptr, handle_ptr);
+      result != X_STATUS_SUCCESS) {
+    return result;
+  }
+
+  auto ev = object_ref<XEvent>(new XEvent(kernel_state()));
+  ev->Initialize(!event_type, !!initial_state);
+
+  // obj_attributes may have a name inside of it, if != NULL.
+  if (obj_attributes_ptr) {
+    ev->SetAttributes(obj_attributes_ptr);
+  }
+
+  if (handle_ptr) {
+    *handle_ptr = ev->handle();
+  }
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(NtCreateEvent, kThreading, kImplemented);
+
+uint32_t xeNtSetEvent(uint32_t handle, xe::be<uint32_t>* previous_state_ptr) {
+  X_STATUS result = X_STATUS_SUCCESS;
+
+  auto ev = kernel_state()->object_table()->LookupObject<XEvent>(handle);
+  if (ev) {
+    // d3 ros does this
+    if (ev->type() != XObject::Type::Event) {
+      return X_STATUS_OBJECT_TYPE_MISMATCH;
+    }
+    int32_t was_signalled = ev->Set(0, false);
+    if (previous_state_ptr) {
+      *previous_state_ptr = static_cast<uint32_t>(was_signalled);
+    }
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+
+  return result;
+}
+
+dword_result_t NtSetEvent_entry(dword_t handle, lpdword_t previous_state_ptr) {
+  return xeNtSetEvent(handle, previous_state_ptr);
+}
+DECLARE_XBOXKRNL_EXPORT2(NtSetEvent, kThreading, kImplemented, kHighFrequency);
+
+dword_result_t NtPulseEvent_entry(dword_t handle,
+                                  lpdword_t previous_state_ptr) {
+  X_STATUS result = X_STATUS_SUCCESS;
+
+  auto ev = kernel_state()->object_table()->LookupObject<XEvent>(handle);
+  if (ev) {
+    int32_t was_signalled = ev->Pulse(0, false);
+    if (previous_state_ptr) {
+      *previous_state_ptr = static_cast<uint32_t>(was_signalled);
+    }
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+
+  return result;
+}
+DECLARE_XBOXKRNL_EXPORT2(NtPulseEvent, kThreading, kImplemented,
+                         kHighFrequency);
+dword_result_t NtQueryEvent_entry(dword_t handle, lpdword_t out_struc) {
+  X_STATUS result = X_STATUS_SUCCESS;
+
+  auto ev = kernel_state()->object_table()->LookupObject<XEvent>(handle);
+  if (ev) {
+    uint32_t type_tmp, state_tmp;
+
+    ev->Query(&type_tmp, &state_tmp);
+
+    out_struc[0] = type_tmp;
+    out_struc[1] = state_tmp;
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+
+  return result;
+}
+DECLARE_XBOXKRNL_EXPORT2(NtQueryEvent, kThreading, kImplemented,
+                         kHighFrequency);
+uint32_t xeNtClearEvent(uint32_t handle) {
+  X_STATUS result = X_STATUS_SUCCESS;
+
+  auto ev = kernel_state()->object_table()->LookupObject<XEvent>(handle);
+  if (ev) {
+    ev->Reset();
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+
+  return result;
+}
+
+dword_result_t NtClearEvent_entry(dword_t handle) {
+  return xeNtClearEvent(handle);
+}
+DECLARE_XBOXKRNL_EXPORT2(NtClearEvent, kThreading, kImplemented,
+                         kHighFrequency);
+
+// https://msdn.microsoft.com/en-us/library/windows/hardware/ff552150(v=vs.85).aspx
+void KeInitializeSemaphore_entry(pointer_t<X_KSEMAPHORE> semaphore_ptr,
+                                 dword_t count, dword_t limit) {
+  semaphore_ptr.Zero();
+  semaphore_ptr->header.type = SemaphoreObject;
+  semaphore_ptr->header.signal_state = (uint32_t)count;
+  semaphore_ptr->limit = (uint32_t)limit;
+
+  auto sem = XObject::GetNativeObject<XSemaphore>(kernel_state(), semaphore_ptr,
+                                                  SemaphoreObject);
+  if (!sem) {
+    assert_always();
+    return;
+  }
+}
+DECLARE_XBOXKRNL_EXPORT1(KeInitializeSemaphore, kThreading, kImplemented);
+
+uint32_t xeKeReleaseSemaphore(X_KSEMAPHORE* semaphore_ptr, uint32_t increment,
+                              uint32_t adjustment, uint32_t wait) {
+  auto sem = XObject::GetNativeObject<XSemaphore>(kernel_state(), semaphore_ptr,
+                                                  SemaphoreObject);
+  if (!sem) {
+    assert_always();
+    return 0;
+  }
+
+  sem->set_priority_increment(increment);
+
+  int32_t previous_count = 0;
+  [[maybe_unused]] bool success =
+      sem->ReleaseSemaphore(adjustment, &previous_count);
+  return static_cast<uint32_t>(previous_count);
+}
+
+dword_result_t KeReleaseSemaphore_entry(pointer_t<X_KSEMAPHORE> semaphore_ptr,
+                                        dword_t increment, dword_t adjustment,
+                                        dword_t wait) {
+  return xeKeReleaseSemaphore(semaphore_ptr, increment, adjustment, wait);
+}
+DECLARE_XBOXKRNL_EXPORT1(KeReleaseSemaphore, kThreading, kImplemented);
+
+dword_result_t NtCreateSemaphore_entry(
+    lpdword_t handle_ptr, pointer_t<X_OBJECT_ATTRIBUTES> obj_attributes_ptr,
+    dword_t count, dword_t limit) {
+  // Check for an existing semaphore with the same name.
+  if (X_STATUS result = OpenNamedObject<XSemaphore>(
+          kernel_state(), obj_attributes_ptr, handle_ptr);
+      result != X_STATUS_SUCCESS) {
+    return result;
+  }
+
+  auto sem = object_ref<XSemaphore>(new XSemaphore(kernel_state()));
+  if (!sem->Initialize((int32_t)count, (int32_t)limit)) {
+    if (handle_ptr) {
+      *handle_ptr = 0;
+    }
+    sem->ReleaseHandle();
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  // obj_attributes may have a name inside of it, if != NULL.
+  if (obj_attributes_ptr) {
+    sem->SetAttributes(obj_attributes_ptr);
+  }
+
+  if (handle_ptr) {
+    *handle_ptr = sem->handle();
+  }
+
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(NtCreateSemaphore, kThreading, kImplemented);
+
+dword_result_t NtReleaseSemaphore_entry(dword_t sem_handle,
+                                        dword_t release_count,
+                                        lpdword_t previous_count_ptr) {
+  X_STATUS result = X_STATUS_SUCCESS;
+  int32_t previous_count = 0;
+
+  auto sem =
+      kernel_state()->object_table()->LookupObject<XSemaphore>(sem_handle);
+  if (sem) {
+    bool success =
+        sem->ReleaseSemaphore((int32_t)release_count, &previous_count);
+    if (!success) {
+      // Releasing would exceed the semaphore's maximum count
+      XELOGW(
+          "NtReleaseSemaphore: release_count={} would exceed maximum (current "
+          "count={})",
+          uint32_t(release_count), previous_count);
+      result = X_STATUS_SEMAPHORE_LIMIT_EXCEEDED;
+    }
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+  if (previous_count_ptr && XSUCCEEDED(result)) {
+    *previous_count_ptr = (uint32_t)previous_count;
+  }
+
+  return result;
+}
+DECLARE_XBOXKRNL_EXPORT2(NtReleaseSemaphore, kThreading, kImplemented,
+                         kHighFrequency);
+
+dword_result_t NtCreateMutant_entry(
+    lpdword_t handle_out, pointer_t<X_OBJECT_ATTRIBUTES> obj_attributes,
+    dword_t initial_owner) {
+  // Check for an existing timer with the same name.
+  if (X_STATUS result = OpenNamedObject<XMutant>(
+          kernel_state(), obj_attributes.guest_address(), handle_out);
+      result != X_STATUS_SUCCESS) {
+    return result;
+  }
+
+  auto mutant = object_ref<XMutant>(new XMutant(kernel_state()));
+  mutant->Initialize(initial_owner ? true : false);
+
+  // obj_attributes may have a name inside of it, if != NULL.
+  if (obj_attributes) {
+    mutant->SetAttributes(obj_attributes);
+  }
+
+  if (handle_out) {
+    *handle_out = mutant->handle();
+  }
+
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(NtCreateMutant, kThreading, kImplemented);
+
+dword_result_t NtReleaseMutant_entry(dword_t mutant_handle,
+                                     lpdword_t previous_count) {
+  // This doesn't seem to be supported.
+  // int32_t previous_count_ptr = SHIM_GET_ARG_32(2);
+
+  // Whatever arg 1 is all games seem to set it to 0, so whether it's
+  // abandon or wait we just say false. Which is good, cause they are
+  // both ignored.
+  uint32_t priority_increment = 0;
+  bool abandon = false;
+  bool wait = false;
+
+  X_STATUS result = X_STATUS_SUCCESS;
+
+  auto mutant =
+      kernel_state()->object_table()->LookupObject<XMutant>(mutant_handle);
+  if (mutant) {
+    result = mutant->ReleaseMutant(priority_increment, abandon, wait);
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+
+  return result;
+}
+DECLARE_XBOXKRNL_EXPORT1(NtReleaseMutant, kThreading, kImplemented);
+
+dword_result_t NtCreateTimer_entry(
+    lpdword_t handle_ptr, pointer_t<X_OBJECT_ATTRIBUTES> obj_attributes_ptr,
+    dword_t timer_type) {
+  // timer_type = NotificationTimer (0) or SynchronizationTimer (1)
+  if (timer_type > 1) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  // Check for an existing timer with the same name.
+  if (X_STATUS result = OpenNamedObject<XTimer>(kernel_state(),
+                                                obj_attributes_ptr, handle_ptr);
+      result != X_STATUS_SUCCESS) {
+    return result;
+  }
+
+  auto timer = object_ref<XTimer>(new XTimer(kernel_state()));
+  timer->Initialize(timer_type);
+
+  // obj_attributes may have a name inside of it, if != NULL.
+  if (obj_attributes_ptr) {
+    timer->SetAttributes(obj_attributes_ptr);
+  }
+
+  if (handle_ptr) {
+    *handle_ptr = timer->handle();
+  }
+
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(NtCreateTimer, kThreading, kImplemented);
+
+dword_result_t NtSetTimerEx_entry(dword_t timer_handle, lpqword_t due_time_ptr,
+                                  lpvoid_t routine_ptr /*PTIMERAPCROUTINE*/,
+                                  dword_t mode, lpvoid_t routine_arg,
+                                  dword_t resume, dword_t period_ms,
+                                  lpdword_t unk_zero) {
+  assert_true(mode == 1);
+  assert_true(!unk_zero);
+
+  if (unk_zero) {
+    XELOGI("NtSetTimerEx: unk_zero is set!");
+  }
+
+  uint64_t due_time = *due_time_ptr;
+
+  X_STATUS result = X_STATUS_SUCCESS;
+
+  auto timer =
+      kernel_state()->object_table()->LookupObject<XTimer>(timer_handle);
+  if (timer) {
+    result =
+        timer->SetTimer(due_time, period_ms, routine_ptr.guest_address(),
+                        routine_arg.guest_address(), resume ? true : false);
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+
+  return result;
+}
+DECLARE_XBOXKRNL_EXPORT1(NtSetTimerEx, kThreading, kImplemented);
+
+dword_result_t NtCancelTimer_entry(dword_t timer_handle,
+                                   pointer_t<uint8_t> current_state_ptr) {
+  auto timer =
+      kernel_state()->object_table()->LookupObject<XTimer>(timer_handle);
+  if (!timer) {
+    return X_STATUS_INVALID_HANDLE;
+  }
+  // The BOOLEAN signal state, which cancelling leaves as it is.
+  if (current_state_ptr) {
+    *current_state_ptr = timer->IsSignaled() ? 1 : 0;
+  }
+  return timer->Cancel();
+}
+DECLARE_XBOXKRNL_EXPORT1(NtCancelTimer, kThreading, kImplemented);
+
+uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason,
+                                 uint32_t processor_mode, uint32_t alertable,
+                                 uint64_t* timeout_ptr) {
+  xeProcessKernelApcs(nullptr);
+  if (XObject::TryWaitUnwrappedEvent(kernel_state(), object_ptr)) {
+    return X_STATUS_SUCCESS;
+  }
+  auto object = XObject::GetNativeObject<XObject>(kernel_state(), object_ptr);
+
+  if (!object) {
+    // The only kind-of failure code (though this should never happen)
+    assert_always();
+    return X_STATUS_ABANDONED_WAIT_0;
+  }
+
+  X_STATUS result =
+      object->Wait(wait_reason, processor_mode, alertable, timeout_ptr);
+  if (alertable) {
+    if (result == X_STATUS_USER_APC) {
+      xeProcessUserApcs(nullptr);
+    }
+  }
+  return result;
+}
+
+dword_result_t KeWaitForSingleObject_entry(lpvoid_t object_ptr,
+                                           dword_t wait_reason,
+                                           dword_t processor_mode,
+                                           dword_t alertable,
+                                           lpqword_t timeout_ptr) {
+  SCOPE_profile_cpu_i("guestsync", "KeWaitForSingleObject");
+  uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+  return xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode,
+                                 alertable, timeout_ptr ? &timeout : nullptr);
+}
+DECLARE_XBOXKRNL_EXPORT3(KeWaitForSingleObject, kThreading, kImplemented,
+                         kBlocking, kHighFrequency);
+
+uint32_t NtWaitForSingleObjectEx(uint32_t object_handle, uint32_t wait_mode,
+                                 uint32_t alertable, uint64_t* timeout_ptr) {
+  xeProcessKernelApcs(nullptr);
+  X_STATUS result = X_STATUS_SUCCESS;
+
+  auto object =
+      kernel_state()->object_table()->LookupObject<XObject>(object_handle);
+  if (object) {
+    uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+    result =
+        object->Wait(3, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
+    if (alertable) {
+      if (result == X_STATUS_USER_APC) {
+        xeProcessUserApcs(nullptr);
+      }
+    }
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+
+  return result;
+}
+
+dword_result_t NtWaitForSingleObjectEx_entry(dword_t object_handle,
+                                             dword_t wait_mode,
+                                             dword_t alertable,
+                                             lpqword_t timeout_ptr) {
+  SCOPE_profile_cpu_i("guestsync", "NtWaitForSingleObjectEx");
+  uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+  return NtWaitForSingleObjectEx(object_handle, wait_mode, alertable,
+                                 timeout_ptr ? &timeout : nullptr);
+}
+DECLARE_XBOXKRNL_EXPORT3(NtWaitForSingleObjectEx, kThreading, kImplemented,
+                         kBlocking, kHighFrequency);
+
+dword_result_t KeWaitForMultipleObjects_entry(
+    dword_t count, lpdword_t objects_ptr, dword_t wait_type,
+    dword_t wait_reason, dword_t processor_mode, dword_t alertable,
+    lpqword_t timeout_ptr, pointer_t<X_KWAIT_BLOCK> wait_block_array_ptr) {
+  SCOPE_profile_cpu_i("guestsync", "KeWaitForMultipleObjects");
+  assert_true(wait_type <= X_KWAIT_REASON::WaitAny);
+  xeProcessKernelApcs(nullptr);
+
+  object_ref<XObject> objects[64];
+  if (count > xe::countof(objects)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  {
+    auto crit = global_critical_region::AcquireDirect();
+    for (uint32_t n = 0; n < count; n++) {
+      auto object_ptr = kernel_memory()->TranslateVirtual(objects_ptr[n]);
+      auto object_ref = XObject::GetNativeObject<XObject>(
+          kernel_state(), object_ptr, UndefinedObject, true);
+      if (!object_ref) {
+        return X_STATUS_INVALID_PARAMETER;
+      }
+
+      objects[n] = std::move(object_ref);
+    }
+  }
+  uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+  X_STATUS result = XObject::WaitMultiple(
+      uint32_t(count), reinterpret_cast<XObject**>(&objects[0]), wait_type,
+      wait_reason, processor_mode, alertable, timeout_ptr ? &timeout : nullptr);
+  if (alertable) {
+    if (result == X_STATUS_USER_APC) {
+      xeProcessUserApcs(nullptr);
+    }
+  }
+  return result;
+}
+DECLARE_XBOXKRNL_EXPORT3(KeWaitForMultipleObjects, kThreading, kImplemented,
+                         kBlocking, kHighFrequency);
+
+uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, xe::be<uint32_t>* handles,
+                                      uint32_t wait_type, uint32_t wait_mode,
+                                      uint32_t alertable,
+                                      uint64_t* timeout_ptr) {
+  assert_true(wait_type <= X_KWAIT_REASON::WaitAny);
+  xeProcessKernelApcs(nullptr);
+
+  object_ref<XObject> objects[64];
+  if (count > xe::countof(objects)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  /*
+        Reserving to squash the constant reallocations, in a benchmark of one
+     particular game over a period of five minutes roughly 11% of CPU time was
+     spent inside a helper function to Windows' heap allocation function. 7% of
+     that time was traced back to here
+
+         edit: actually switched to fixed size array, as there can never be more
+     than 64 events specified
+  */
+  {
+    auto crit = global_critical_region::AcquireDirect();
+    for (uint32_t n = 0; n < count; n++) {
+      uint32_t object_handle = handles[n];
+      auto object = kernel_state()->object_table()->LookupObject<XObject>(
+          object_handle, true);
+      if (!object) {
+        return X_STATUS_INVALID_PARAMETER;
+      }
+      objects[n] = std::move(object);
+    }
+  }
+
+  // A wait for all can't name an object twice, by any handle.
+  if (wait_type == X_KWAIT_REASON::WaitAll) {
+    for (uint32_t i = 0; i < count; i++) {
+      for (uint32_t j = i + 1; j < count; j++) {
+        if (objects[i].get() == objects[j].get()) {
+          return X_STATUS_INVALID_PARAMETER_MIX;
+        }
+      }
+    }
+  }
+
+  auto result =
+      XObject::WaitMultiple(count, reinterpret_cast<XObject**>(&objects[0]),
+                            wait_type, 6, wait_mode, alertable, timeout_ptr);
+  if (alertable) {
+    if (result == X_STATUS_USER_APC) {
+      xeProcessUserApcs(nullptr);
+    }
+  }
+  return result;
+}
+
+dword_result_t NtWaitForMultipleObjectsEx_entry(
+    dword_t count, lpdword_t handles, dword_t wait_type, dword_t wait_mode,
+    dword_t alertable, lpqword_t timeout_ptr) {
+  SCOPE_profile_cpu_i("guestsync", "NtWaitForMultipleObjectsEx");
+  uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+  if (!count || count > 64 ||
+      (wait_type != X_KWAIT_REASON::WaitAny && wait_type)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode,
+                                      alertable,
+                                      timeout_ptr ? &timeout : nullptr);
+}
+DECLARE_XBOXKRNL_EXPORT3(NtWaitForMultipleObjectsEx, kThreading, kImplemented,
+                         kBlocking, kHighFrequency);
+
+dword_result_t NtSignalAndWaitForSingleObjectEx_entry(dword_t signal_handle,
+                                                      dword_t wait_handle,
+                                                      dword_t wait_mode,
+                                                      dword_t alertable,
+                                                      lpqword_t timeout_ptr) {
+  xeProcessKernelApcs(nullptr);
+  X_STATUS result = X_STATUS_SUCCESS;
+  // pre-lock for these two handle lookups
+  global_critical_region::mutex().lock();
+
+  auto signal_object = kernel_state()->object_table()->LookupObject<XObject>(
+      signal_handle, true);
+  auto wait_object =
+      kernel_state()->object_table()->LookupObject<XObject>(wait_handle, true);
+  global_critical_region::mutex().unlock();
+  if (signal_object && wait_object) {
+    uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+    result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3,
+                                    wait_mode, alertable,
+                                    timeout_ptr ? &timeout : nullptr);
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+
+  if (alertable) {
+    if (result == X_STATUS_USER_APC) {
+      xeProcessUserApcs(nullptr);
+    }
+  }
+  return result;
+}
+DECLARE_XBOXKRNL_EXPORT3(NtSignalAndWaitForSingleObjectEx, kThreading,
+                         kImplemented, kBlocking, kHighFrequency);
+
+static void PrefetchForCAS(const void* value) { swcache::PrefetchW(value); }
+
+// Pauses between host yields while a spinlock is held on another dispatch
+// thread.
+static constexpr int kRemoteHolderSpinTries = 16;
+
+uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock,
+                               bool change_irql) {
+  SCOPE_profile_cpu_i("guestsync", "SpinLockAcquire");
+  auto old_irql = change_irql ? xeKfRaiseIrql(ctx, 2) : 0;
+
+  PrefetchForCAS(lock);
+  assert_true(lock->prcb_of_owner != static_cast<uint32_t>(ctx->r[13]));
+
+  uint32_t our_pcr = static_cast<uint32_t>(ctx->r[13]);
+  uint8_t our_cpu =
+      ctx->TranslateVirtualGPR<X_KPCR*>(our_pcr)->prcb_data.current_cpu;
+
+  // Lock.
+  while (
+      !xe::atomic_cas(0, xe::byte_swap(our_pcr), &lock->prcb_of_owner.value)) {
+    // Under the cooperative scheduler the holder may be a fiber queued behind
+    // us on this dispatch thread, so it can only run if we yield the fiber. A
+    // holder on another dispatch thread runs there. Like the console at
+    // DISPATCH_LEVEL, this spins until it releases and yields only the host
+    // thread.
+    if (XThread::GetCurrentFiberThread()) {
+      uint32_t owner_pcr_be = lock->prcb_of_owner.value;
+      if (!owner_pcr_be) {
+        continue;  // freed between the CAS and the read
+      }
+      auto* owner_kpcr =
+          ctx->TranslateVirtual<X_KPCR*>(xe::byte_swap(owner_pcr_be));
+      auto* scheduler = ctx->kernel_state->guest_scheduler();
+      // Teardown needs the fiber back at its dispatch loop, which a holder
+      // stopped with its own dispatch thread would never allow.
+      if (scheduler->DispatchCpuOf(owner_kpcr->prcb_data.current_cpu) !=
+              scheduler->DispatchCpuOf(our_cpu) &&
+          !scheduler->shutting_down()) {
+        volatile uint32_t* owner_raw = &lock->prcb_of_owner.value;
+        for (int i = 0; i < kRemoteHolderSpinTries && *owner_raw; ++i) {
+          SpinPause();
+        }
+        if (*owner_raw) {
+          xe::threading::MaybeYield();
+        }
+        continue;
+      }
+      GuestScheduler::SpinYield();
+      continue;
+    }
+    // On real hardware, threads sharing a Xenon HW thread are serialized by
+    // the kernel scheduler — the spinner would be preempted within one
+    // timeslice (~1ms) so the holder can make progress.  In the naive
+    // host-thread model both threads run truly in parallel, so the spinner
+    // can burn its entire host quantum without giving the holder a chance.
+    //
+    // Check whether the lock holder is assigned to the same guest CPU as us.
+    // If so, yield the host thread aggressively (Sleep(0)) to force a host
+    // context switch and give the holder a chance to run and release.
+    // The relationship is stable — affinity doesn't change while a thread
+    // holds a spinlock — so one check per contention episode is sufficient.
+    uint32_t owner_pcr_be = lock->prcb_of_owner.value;
+    if (owner_pcr_be) {
+      uint32_t owner_pcr = xe::byte_swap(owner_pcr_be);
+      auto* owner_kpcr = ctx->TranslateVirtual<X_KPCR*>(owner_pcr);
+      if (owner_kpcr->prcb_data.current_cpu == our_cpu) {
+        xe::threading::Sleep(std::chrono::milliseconds(0));
+        continue;
+      }
+    }
+    xe::threading::MaybeYield();
+  }
+
+  return old_irql;
+}
+
+dword_result_t KfAcquireSpinLock_entry(pointer_t<X_KSPINLOCK> lock_ptr,
+                                       const ppc_context_t& context) {
+  return xeKeKfAcquireSpinLock(context, lock_ptr, true);
+}
+DECLARE_XBOXKRNL_EXPORT3(KfAcquireSpinLock, kThreading, kImplemented, kBlocking,
+                         kHighFrequency);
+
+void xeKeKfReleaseSpinLock(PPCContext* ctx, X_KSPINLOCK* lock,
+                           uint32_t old_irql, bool change_irql) {
+  assert_true(lock->prcb_of_owner == static_cast<uint32_t>(ctx->r[13]));
+  // Unlock with release semantics to ensure all prior writes are visible.
+  xe::atomic_store_release(0u, &lock->prcb_of_owner.value);
+
+  if (change_irql) {
+    // Unlock.
+    if (old_irql >= 2) {
+      return;
+    }
+
+    // Restore IRQL.
+    xeKfLowerIrql(ctx, old_irql);
+  }
+}
+
+// Lowering IRQL below APC_LEVEL delivers a suspend the raise held off.
+static void DeliverSuspendOnLowerIrql(uint32_t new_irql) {
+  if (new_irql < 1) {
+    if (XThread* self = XThread::GetCurrentFiberThread()) {
+      self->DeliverPendingSuspend();
+    }
+  }
+}
+
+void KfReleaseSpinLock_entry(pointer_t<X_KSPINLOCK> lock_ptr, dword_t old_irql,
+                             const ppc_context_t& ppc_ctx) {
+  xeKeKfReleaseSpinLock(ppc_ctx, lock_ptr, old_irql, true);
+  DeliverSuspendOnLowerIrql(old_irql);
+}
+
+DECLARE_XBOXKRNL_EXPORT2(KfReleaseSpinLock, kThreading, kImplemented,
+                         kHighFrequency);
+// todo: this is not accurate
+void KeAcquireSpinLockAtRaisedIrql_entry(pointer_t<X_KSPINLOCK> lock_ptr,
+                                         const ppc_context_t& ppc_ctx) {
+  xeKeKfAcquireSpinLock(ppc_ctx, lock_ptr, false);
+}
+DECLARE_XBOXKRNL_EXPORT3(KeAcquireSpinLockAtRaisedIrql, kThreading,
+                         kImplemented, kBlocking, kHighFrequency);
+
+dword_result_t KeTryToAcquireSpinLockAtRaisedIrql_entry(
+    pointer_t<X_KSPINLOCK> lock_ptr, const ppc_context_t& ppc_ctx) {
+  // A lock that's held, even by this processor, is refused with 0.
+  auto lock = reinterpret_cast<uint32_t*>(lock_ptr.host_address());
+  PrefetchForCAS(lock);
+  if (!ppc_ctx->processor->GuestAtomicCAS32(
+          ppc_ctx, 0, static_cast<uint32_t>(ppc_ctx->r[13]),
+          lock_ptr.guest_address())) {
+    return 0;
+  }
+  return 1;
+}
+DECLARE_XBOXKRNL_EXPORT4(KeTryToAcquireSpinLockAtRaisedIrql, kThreading,
+                         kImplemented, kBlocking, kHighFrequency, kSketchy);
+
+void KeReleaseSpinLockFromRaisedIrql_entry(pointer_t<X_KSPINLOCK> lock_ptr,
+                                           const ppc_context_t& ppc_ctx) {
+  xeKeKfReleaseSpinLock(ppc_ctx, lock_ptr, 0, false);
+}
+
+DECLARE_XBOXKRNL_EXPORT2(KeReleaseSpinLockFromRaisedIrql, kThreading,
+                         kImplemented, kHighFrequency);
+
+void KeEnterCriticalRegion_entry() {
+  XThread::GetCurrentThread()->EnterCriticalRegion();
+}
+DECLARE_XBOXKRNL_EXPORT2(KeEnterCriticalRegion, kThreading, kImplemented,
+                         kHighFrequency);
+
+void KeLeaveCriticalRegion_entry(const ppc_context_t& ctx) {
+  XThread::GetCurrentThread()->LeaveCriticalRegion();
+  // Kernel APCs the region held off run as it ends.
+  xeProcessKernelApcs(ctx);
+}
+DECLARE_XBOXKRNL_EXPORT2(KeLeaveCriticalRegion, kThreading, kImplemented,
+                         kHighFrequency);
+
+dword_result_t KeRaiseIrqlToDpcLevel_entry(const ppc_context_t& ctx) {
+  auto pcr = ctx.GetPCR();
+  uint32_t old_irql = pcr->current_irql;
+
+  if (old_irql > 2) {
+    XELOGE("KeRaiseIrqlToDpcLevel - old_irql > 2");
+  }
+
+  pcr->current_irql = 2;
+
+  return old_irql;
+}
+DECLARE_XBOXKRNL_EXPORT2(KeRaiseIrqlToDpcLevel, kThreading, kImplemented,
+                         kHighFrequency);
+void xeKfLowerIrql(PPCContext* ctx, unsigned char new_irql) {
+  X_KPCR* kpcr = ctx->TranslateVirtualGPR<X_KPCR*>(ctx->r[13]);
+
+  if (new_irql > kpcr->current_irql) {
+    XELOGE("KfLowerIrql : new_irql > kpcr->current_irql!");
+  }
+  kpcr->current_irql = new_irql;
+  if (new_irql < 2) {
+    xeRunPendingDpcs(ctx);
+  }
+}
+// irql is supposed to be per thread afaik...
+void KfLowerIrql_entry(dword_t new_irql, const ppc_context_t& ctx) {
+  xeKfLowerIrql(ctx, static_cast<unsigned char>(new_irql));
+  DeliverSuspendOnLowerIrql(new_irql);
+}
+DECLARE_XBOXKRNL_EXPORT2(KfLowerIrql, kThreading, kImplemented, kHighFrequency);
+
+unsigned char xeKfRaiseIrql(PPCContext* ctx, unsigned char new_irql) {
+  X_KPCR* v1 = ctx->TranslateVirtualGPR<X_KPCR*>(ctx->r[13]);
+
+  uint32_t old_irql = v1->current_irql;
+  v1->current_irql = new_irql;
+
+  if (old_irql > (unsigned int)new_irql) {
+    XELOGE("KfRaiseIrql - old_irql > new_irql!");
+  }
+  return old_irql;
+}
+// used by aurora's nova plugin
+// like the other irql related functions, writes to an unknown mmio range (
+// 0x7FFF ). The range is indexed by the low 16 bits of the KPCR's pointer (so
+// r13)
+dword_result_t KfRaiseIrql_entry(dword_t new_irql, const ppc_context_t& ctx) {
+  return xeKfRaiseIrql(ctx, new_irql);
+}
+
+DECLARE_XBOXKRNL_EXPORT2(KfRaiseIrql, kThreading, kImplemented, kHighFrequency);
+
+uint32_t xeNtQueueApcThread(uint32_t thread_handle, uint32_t apc_routine,
+                            uint32_t apc_routine_context, uint32_t arg1,
+                            uint32_t arg2, uint32_t apc_mode,
+                            cpu::ppc::PPCContext* context) {
+  auto kernelstate = context->kernel_state;
+  auto memory = kernelstate->memory();
+  auto thread =
+      kernelstate->object_table()->LookupObject<XThread>(thread_handle);
+
+  if (!thread) {
+    XELOGE("NtQueueApcThread: Incorrect thread handle! Might cause crash");
+    return X_STATUS_INVALID_HANDLE;
+  }
+
+  uint32_t apc_ptr = memory->SystemHeapAlloc(XAPC::kSize);
+  if (!apc_ptr) {
+    return X_STATUS_NO_MEMORY;
+  }
+  XAPC* apc = context->TranslateVirtual<XAPC*>(apc_ptr);
+  xeKeInitializeApc(apc, thread->guest_object(), XAPC::kDummyKernelRoutine, 0,
+                    apc_routine, apc_mode, apc_routine_context);
+
+  if (!xeInsertQueueApcAndWake(thread.get(), apc, arg1, arg2, context)) {
+    memory->SystemHeapFree(apc_ptr);
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  return X_STATUS_SUCCESS;
+}
+
+uint32_t xeInsertQueueApcAndWake(XThread* thread, XAPC* apc, uint32_t arg1,
+                                 uint32_t arg2, cpu::ppc::PPCContext* context) {
+  if (!xeKeInsertQueueApc(apc, arg1, arg2, 0, context)) {
+    return 0;
+  }
+  // Awaken a sleeping alertable thread to process real apcs. A host thread gets
+  // a no-op user callback to break its wait, a fiber gets a scheduler poke so
+  // its alertable poll re-runs.
+  if (thread->thread()) {
+    thread->thread()->QueueUserCallback([]() {});
+  } else {
+    context->kernel_state->guest_scheduler()->WakeAll();
+  }
+  return 1;
+}
+dword_result_t NtQueueApcThread_entry(dword_t thread_handle,
+                                      lpvoid_t apc_routine,
+                                      lpvoid_t apc_routine_context,
+                                      lpvoid_t arg1, lpvoid_t arg2,
+                                      const ppc_context_t& context) {
+  return xeNtQueueApcThread(thread_handle, apc_routine, apc_routine_context,
+                            arg1, arg2, 1 /*user apc mode*/, context);
+}
+
+// Runs every queued APC on |list_index| (1 = user, 0 = kernel), executing the
+// kernel and normal routines on the caller's guest context. Returns true if
+// any ran.
+static bool ProcessApcList(PPCContext* ctx, X_KTHREAD* current_thread,
+                           uint32_t list_index) {
+  bool processed_any = false;
+
+  uint32_t unlocked_irql =
+      xeKeKfAcquireSpinLock(ctx, &current_thread->apc_lock);
+
+  auto& apc_queue = current_thread->apc_lists[list_index];
+
+  // use guest stack for temporaries
+  uint32_t old_stack_pointer = static_cast<uint32_t>(ctx->r[1]);
+
+  uint32_t scratch_address = old_stack_pointer - 16;
+  ctx->r[1] = old_stack_pointer - 32;
+
+  while (!apc_queue.empty(ctx)) {
+    XAPC* apc = apc_queue.ListEntryObject(
+        ctx->TranslateVirtual<X_LIST_ENTRY*>(apc_queue.flink_ptr));
+    uint32_t apc_ptr = ctx->HostToGuestVirtual(apc);
+
+    uint8_t* scratch_ptr = ctx->TranslateVirtual(scratch_address);
+    xe::store_and_swap<uint32_t>(scratch_ptr + 0, apc->normal_routine);
+    xe::store_and_swap<uint32_t>(scratch_ptr + 4, apc->normal_context);
+    xe::store_and_swap<uint32_t>(scratch_ptr + 8, apc->arg1);
+    xe::store_and_swap<uint32_t>(scratch_ptr + 12, apc->arg2);
+    // An owned APC can be freed by its owner as soon as the lock drops.
+    uint32_t kernel_routine = apc->kernel_routine;
+    util::XeRemoveEntryList(&apc->list_entry, ctx);
+    apc->enqueued = 0;
+
+    xeKeKfReleaseSpinLock(ctx, &current_thread->apc_lock, unlocked_irql);
+    processed_any = true;
+    if (kernel_routine == XAPC::kDummyKernelRoutine) {
+      ctx->kernel_state->memory()->SystemHeapFree(apc_ptr);
+    } else if (kernel_routine != XAPC::kOwnedKernelRoutine) {
+      uint64_t kernel_args[] = {
+          apc_ptr,
+          scratch_address + 0,
+          scratch_address + 4,
+          scratch_address + 8,
+          scratch_address + 12,
+      };
+      ctx->processor->Execute(ctx->thread_state, kernel_routine, kernel_args,
+                              xe::countof(kernel_args));
+    }
+
+    uint32_t normal_routine = xe::load_and_swap<uint32_t>(scratch_ptr + 0);
+    uint32_t normal_context = xe::load_and_swap<uint32_t>(scratch_ptr + 4);
+    uint32_t arg1 = xe::load_and_swap<uint32_t>(scratch_ptr + 8);
+    uint32_t arg2 = xe::load_and_swap<uint32_t>(scratch_ptr + 12);
+
+    if (normal_routine) {
+      uint64_t normal_args[] = {normal_context, arg1, arg2};
+      ctx->processor->Execute(ctx->thread_state, normal_routine, normal_args,
+                              xe::countof(normal_args));
+    }
+
+    unlocked_irql = xeKeKfAcquireSpinLock(ctx, &current_thread->apc_lock);
+  }
+
+  ctx->r[1] = old_stack_pointer;
+
+  xeKeKfReleaseSpinLock(ctx, &current_thread->apc_lock, unlocked_irql);
+  return processed_any;
+}
+
+X_STATUS xeProcessUserApcs(PPCContext* ctx) {
+  if (!ctx) {
+    ctx = cpu::ThreadState::Get()->context();
+  }
+  auto kpcr = ctx->TranslateVirtualGPR<X_KPCR*>(ctx->r[13]);
+  auto current_thread = ctx->TranslateVirtual(kpcr->prcb_data.current_thread);
+  return ProcessApcList(ctx, current_thread, 1) ? X_STATUS_USER_APC
+                                                : X_STATUS_SUCCESS;
+}
+
+bool xeProcessKernelApcs(PPCContext* ctx) {
+  if (!ctx) {
+    auto* thread_state = cpu::ThreadState::Get();
+    if (!thread_state) {
+      return false;
+    }
+    ctx = thread_state->context();
+  }
+  auto kpcr = ctx->TranslateVirtualGPR<X_KPCR*>(ctx->r[13]);
+  auto current_thread = ctx->TranslateVirtual(kpcr->prcb_data.current_thread);
+  bool delivered = false;
+  // Masked at APC_LEVEL and above or in a critical region, and never nested.
+  if (kpcr->current_irql < 1 && !current_thread->apc_disable_count &&
+      !current_thread->executing_kernel_apc &&
+      !current_thread->apc_lists[0].empty(ctx)) {
+    current_thread->executing_kernel_apc = 1;
+    delivered = ProcessApcList(ctx, current_thread, 0);
+    if (delivered) {
+      XELOGD("xeProcessKernelApcs: delivered");
+    }
+    current_thread->executing_kernel_apc = 0;
+  }
+  // A suspend is a kernel APC under the same mask.
+  if (XThread* self = XThread::GetCurrentFiberThread()) {
+    delivered |= self->DeliverPendingSuspend();
+  }
+  return delivered;
+}
+
+static void YankApcList(PPCContext* ctx, X_KTHREAD* current_thread,
+                        unsigned apc_mode, bool rundown) {
+  uint32_t unlocked_irql =
+      xeKeKfAcquireSpinLock(ctx, &current_thread->apc_lock);
+
+  XAPC* result = nullptr;
+  auto& user_apc_queue = current_thread->apc_lists[apc_mode];
+
+  if (user_apc_queue.empty(ctx)) {
+    result = nullptr;
+  } else {
+    result = user_apc_queue.HeadObject(ctx);
+    for (auto&& entry : user_apc_queue.IterateForward(ctx)) {
+      entry.enqueued = 0;
+    }
+    util::XeRemoveEntryList(&user_apc_queue, ctx);
+  }
+
+  xeKeKfReleaseSpinLock(ctx, &current_thread->apc_lock, unlocked_irql);
+
+  if (rundown && result) {
+    XAPC* current_entry = result;
+    while (true) {
+      XAPC* this_entry = current_entry;
+      uint32_t next_entry = this_entry->list_entry.flink_ptr;
+
+      if (this_entry->rundown_routine) {
+        uint64_t args[] = {ctx->HostToGuestVirtual(this_entry)};
+        kernel_state()->processor()->Execute(ctx->thread_state,
+                                             this_entry->rundown_routine, args,
+                                             xe::countof(args));
+      } else if (this_entry->kernel_routine != XAPC::kOwnedKernelRoutine) {
+        ctx->kernel_state->memory()->SystemHeapFree(
+            ctx->HostToGuestVirtual(this_entry));
+      }
+
+      if (next_entry == 0) {
+        break;
+      }
+      current_entry = user_apc_queue.ListEntryObject(
+          ctx->TranslateVirtual<X_LIST_ENTRY*>(next_entry));
+      if (current_entry == result) {
+        break;
+      }
+    }
+  }
+}
+
+void xeRundownApcs(cpu::ppc::PPCContext* ctx) {
+  auto kpcr = ctx->TranslateVirtualGPR<X_KPCR*>(ctx->r[13]);
+
+  auto current_thread = ctx->TranslateVirtual(kpcr->prcb_data.current_thread);
+  YankApcList(ctx, current_thread, 1, true);
+  YankApcList(ctx, current_thread, 0, false);
+}
+DECLARE_XBOXKRNL_EXPORT1(NtQueueApcThread, kThreading, kImplemented);
+void xeKeInitializeApc(XAPC* apc, uint32_t thread_ptr, uint32_t kernel_routine,
+                       uint32_t rundown_routine, uint32_t normal_routine,
+                       uint32_t apc_mode, uint32_t normal_context) {
+  apc->thread_ptr = thread_ptr;
+  apc->kernel_routine = kernel_routine;
+  apc->rundown_routine = rundown_routine;
+  apc->normal_routine = normal_routine;
+  apc->type = 18;
+  if (normal_routine) {
+    apc->apc_mode = apc_mode;
+    apc->normal_context = normal_context;
+  } else {
+    apc->apc_mode = 0;
+    apc->normal_context = 0;
+  }
+  apc->enqueued = 0;
+}
+void KeInitializeApc_entry(pointer_t<XAPC> apc, pointer_t<X_KTHREAD> thread_ptr,
+                           lpvoid_t kernel_routine, lpvoid_t rundown_routine,
+                           lpvoid_t normal_routine, dword_t processor_mode,
+                           lpvoid_t normal_context) {
+  xeKeInitializeApc(apc, thread_ptr, kernel_routine, rundown_routine,
+                    normal_routine, processor_mode, normal_context);
+}
+DECLARE_XBOXKRNL_EXPORT1(KeInitializeApc, kThreading, kImplemented);
+
+// A host thread, such as an I/O worker or a timer callback, queues and removes
+// APCs with the target's context (see XThread::ApcQueueContext). It must leave
+// the target's IRQL alone, as the target may change it at the same time.
+static bool CallerIsHostThread() { return !cpu::ThreadState::Get(); }
+
+uint32_t xeKeInsertQueueApc(XAPC* apc, uint32_t arg1, uint32_t arg2,
+                            uint32_t priority_increment,
+                            cpu::ppc::PPCContext* context) {
+  uint32_t thread_guest_pointer = apc->thread_ptr;
+  if (!thread_guest_pointer) {
+    return 0;
+  }
+  auto target_thread = context->TranslateVirtual<X_KTHREAD*>(apc->thread_ptr);
+  const bool change_irql = !CallerIsHostThread();
+  auto old_irql =
+      xeKeKfAcquireSpinLock(context, &target_thread->apc_lock, change_irql);
+  uint32_t result;
+  if (!target_thread->may_queue_apcs || apc->enqueued) {
+    result = 0;
+  } else {
+    apc->arg1 = arg1;
+    apc->arg2 = arg2;
+
+    auto& which_list = target_thread->apc_lists[apc->apc_mode];
+
+    if (apc->normal_routine) {
+      which_list.InsertTail(apc, context);
+    } else {
+      XAPC* insertion_pos = nullptr;
+      for (auto&& sub_apc : which_list.IterateForward(context)) {
+        insertion_pos = &sub_apc;
+        if (sub_apc.normal_routine) {
+          break;
+        }
+      }
+      if (!insertion_pos) {
+        which_list.InsertHead(apc, context);
+      } else {
+        util::XeInsertHeadList(insertion_pos->list_entry.blink_ptr,
+                               &apc->list_entry, context);
+      }
+    }
+
+    apc->enqueued = 1;
+
+    /*
+        todo: this is incomplete, a ton of other logic happens here, i believe
+       for waking the target thread if its alertable
+    */
+    result = 1;
+  }
+  xeKeKfReleaseSpinLock(context, &target_thread->apc_lock, old_irql,
+                        change_irql);
+  return result;
+}
+
+dword_result_t KeInsertQueueApc_entry(pointer_t<XAPC> apc, lpvoid_t arg1,
+                                      lpvoid_t arg2, dword_t priority_increment,
+                                      const ppc_context_t& context) {
+  auto kpcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
+  const bool kernel_apc_to_self =
+      apc->apc_mode == 0 &&
+      context->TranslateVirtual<X_KTHREAD*>(apc->thread_ptr) ==
+          context->TranslateVirtual(kpcr->prcb_data.current_thread);
+  uint32_t result =
+      xeKeInsertQueueApc(apc, arg1, arg2, priority_increment, context);
+  // Lowering IRQL as the APC lock is released runs a kernel APC queued to this
+  // thread.
+  if (result && kernel_apc_to_self) {
+    xeProcessKernelApcs(context);
+  }
+  return result;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeInsertQueueApc, kThreading, kImplemented);
+
+uint32_t xeKeRemoveQueueApc(XAPC* apc, cpu::ppc::PPCContext* context) {
+  bool result = false;
+
+  uint32_t thread_guest_pointer = apc->thread_ptr;
+  if (!thread_guest_pointer) {
+    return 0;
+  }
+  auto target_thread = context->TranslateVirtual<X_KTHREAD*>(apc->thread_ptr);
+  const bool change_irql = !CallerIsHostThread();
+  auto old_irql =
+      xeKeKfAcquireSpinLock(context, &target_thread->apc_lock, change_irql);
+
+  if (apc->enqueued) {
+    result = true;
+    apc->enqueued = 0;
+    util::XeRemoveEntryList(&apc->list_entry, context);
+    // todo: this is incomplete, there is more logic here in actual kernel
+  }
+  xeKeKfReleaseSpinLock(context, &target_thread->apc_lock, old_irql,
+                        change_irql);
+
+  return result ? 1 : 0;
+}
+
+dword_result_t KeRemoveQueueApc_entry(pointer_t<XAPC> apc,
+                                      const ppc_context_t& context) {
+  return xeKeRemoveQueueApc(apc, context);
+}
+DECLARE_XBOXKRNL_EXPORT1(KeRemoveQueueApc, kThreading, kImplemented);
+
+dword_result_t KiApcNormalRoutineNop_entry(dword_t unk0 /* output? */,
+                                           dword_t unk1 /* 0x13 */) {
+  return 0;
+}
+DECLARE_XBOXKRNL_EXPORT1(KiApcNormalRoutineNop, kThreading, kStub);
+
+void KeInitializeDpc_entry(pointer_t<XDPC> dpc, lpvoid_t routine,
+                           lpvoid_t context) {
+  dpc->Initialize(routine, context);
+}
+DECLARE_XBOXKRNL_EXPORT2(KeInitializeDpc, kThreading, kImplemented, kSketchy);
+
+// DPCs queued while a DPC routine runs or at DISPATCH_LEVEL and above, with
+// the guest thread that queued them, as {thread id, DPC}. They run once the
+// routine returns or the thread's IRQL drops below DISPATCH_LEVEL, as the
+// console drains its DPC queue, instead of nesting. Guarded with the global
+// lock.
+static std::vector<std::pair<uint32_t, uint32_t>> deferred_dpcs;
+// Lets an IRQL drop skip the lock when nothing waits.
+static std::atomic<uint32_t> deferred_dpc_count{0};
+
+static bool IsDeferredDpc(uint32_t dpc_ptr) {
+  return std::find_if(deferred_dpcs.begin(), deferred_dpcs.end(),
+                      [dpc_ptr](const auto& deferred) {
+                        return deferred.second == dpc_ptr;
+                      }) != deferred_dpcs.end();
+}
+
+// Runs a DPC on the calling thread. One targeted at another processor
+// (desired_cpu_number n + 1 runs on CPU n) sees that processor's number.
+void xeRunDpc(PPCContext* ctx, uint32_t dpc_ptr, uint32_t arg1, uint32_t arg2) {
+  auto dpc = kernel_memory()->TranslateVirtual<XDPC*>(dpc_ptr);
+  if (!dpc->routine) {
+    return;
+  }
+  auto kpcr = ctx->TranslateVirtualGPR<X_KPCR*>(ctx->r[13]);
+  const uint8_t own_cpu = kpcr->prcb_data.current_cpu;
+  uint64_t args[] = {dpc_ptr, uint32_t(dpc->context), arg1, arg2};
+  if (dpc->desired_cpu_number && dpc->desired_cpu_number <= 6) {
+    kpcr->prcb_data.current_cpu = dpc->desired_cpu_number - 1;
+  }
+  kernel_state()->processor()->Execute(ctx->thread_state, dpc->routine, args,
+                                       xe::countof(args));
+  kpcr->prcb_data.current_cpu = own_cpu;
+}
+
+void xeRunDeferredDpcs(PPCContext* ctx) {
+  while (true) {
+    uint32_t dpc_ptr;
+    {
+      auto global_lock = xe::global_critical_region::AcquireDirect();
+      auto it = std::find_if(deferred_dpcs.begin(), deferred_dpcs.end(),
+                             [ctx](const auto& deferred) {
+                               return deferred.first == ctx->thread_id;
+                             });
+      if (it == deferred_dpcs.end()) {
+        return;
+      }
+      dpc_ptr = it->second;
+      deferred_dpcs.erase(it);
+      --deferred_dpc_count;
+    }
+    auto dpc = kernel_memory()->TranslateVirtual<XDPC*>(dpc_ptr);
+    xeRunDpc(ctx, dpc_ptr, dpc->arg1, dpc->arg2);
+  }
+}
+
+void xeRunPendingDpcs(PPCContext* ctx) {
+  if (!deferred_dpc_count.load(std::memory_order_relaxed)) {
+    return;
+  }
+  auto kpcr = ctx->TranslateVirtualGPR<X_KPCR*>(ctx->r[13]);
+  if (kpcr->prcb_data.dpc_active || kpcr->current_irql >= 2) {
+    return;
+  }
+  {
+    auto global_lock = xe::global_critical_region::AcquireDirect();
+    if (std::none_of(deferred_dpcs.begin(), deferred_dpcs.end(),
+                     [ctx](const auto& deferred) {
+                       return deferred.first == ctx->thread_id;
+                     })) {
+      return;
+    }
+  }
+  DPCImpersonationScope dpc_scope{};
+  kernel_state()->BeginDPCImpersonation(ctx, dpc_scope);
+  xeRunDeferredDpcs(ctx);
+  kernel_state()->EndDPCImpersonation(ctx, dpc_scope);
+}
+
+dword_result_t KeInsertQueueDpc_entry(pointer_t<XDPC> dpc, dword_t arg1,
+                                      dword_t arg2) {
+  // Lock dispatcher.
+  auto global_lock = xe::global_critical_region::AcquireDirect();
+
+  // A DPC still waiting to run is not queued again.
+  if (IsDeferredDpc(dpc.guest_address())) {
+    return 0;
+  }
+
+  // A DPC targeted at another processor runs there, interrupting whatever runs
+  // on it below DISPATCH_LEVEL. Only a fiber pinned to that processor can
+  // stand in for it.
+  auto thread = XThread::GetCurrentThread();
+  const uint8_t desired_cpu = dpc->desired_cpu_number;
+  if (dpc->routine && thread && desired_cpu && desired_cpu <= 6 &&
+      GuestScheduler::enabled()) {
+    auto ppc_context = thread->thread_state()->context();
+    auto kpcr = ppc_context->TranslateVirtualGPR<X_KPCR*>(ppc_context->r[13]);
+    if (desired_cpu - 1 != kpcr->prcb_data.current_cpu ||
+        !XThread::GetCurrentFiberThread()) {
+      kernel_state()->StartProcessorDpcThread(desired_cpu - 1);
+      return kernel_state()->QueueProcessorDpc(desired_cpu - 1,
+                                               dpc.guest_address(), arg1, arg2)
+                 ? 1
+                 : 0;
+    }
+    if (kernel_state()->IsProcessorDpcQueued(desired_cpu - 1,
+                                             dpc.guest_address())) {
+      return 0;
+    }
+  }
+
+  // Prep DPC.
+  dpc->arg1 = (uint32_t)arg1;
+  dpc->arg2 = (uint32_t)arg2;
+
+  // Otherwise it runs inline on the calling thread: it targets the calling
+  // processor, or no scheduler can run it elsewhere.
+  uint32_t routine = dpc->routine;
+  if (routine) {
+    if (thread) {
+      auto thread_state = thread->thread_state();
+      auto ppc_context = thread_state->context();
+      auto kpcr = ppc_context->TranslateVirtualGPR<X_KPCR*>(ppc_context->r[13]);
+
+      // Inside a DPC routine (reentrant KeInsertQueueDpc), the DPC waits
+      // for the running one to return. A routine that queues itself again
+      // would otherwise recurse until the host stack overflows. At
+      // DISPATCH_LEVEL or above it waits for the IRQL to drop, as the caller
+      // may hold a spinlock the routine takes.
+      if (kpcr->prcb_data.dpc_active || kpcr->current_irql >= 2) {
+        deferred_dpcs.emplace_back(ppc_context->thread_id, dpc.guest_address());
+        ++deferred_dpc_count;
+        return 1;
+      }
+
+      DPCImpersonationScope dpc_scope{};
+      kernel_state()->BeginDPCImpersonation(ppc_context, dpc_scope);
+      xeRunDpc(ppc_context, dpc.guest_address(), arg1, arg2);
+      kernel_state()->EndDPCImpersonation(ppc_context, dpc_scope);
+    }
+  }
+
+  return 1;
+}
+DECLARE_XBOXKRNL_EXPORT2(KeInsertQueueDpc, kThreading, kImplemented, kSketchy);
+
+// Whether the DPC was still waiting to run.
+dword_result_t KeRemoveQueueDpc_entry(pointer_t<XDPC> dpc) {
+  bool result = false;
+
+  auto global_lock = xe::global_critical_region::AcquireDirect();
+  if (kernel_state()->RemoveDpc(dpc.guest_address())) {
+    result = true;
+  }
+  if (kernel_state()->RemoveProcessorDpc(dpc.guest_address())) {
+    result = true;
+  }
+  for (auto it = deferred_dpcs.begin(); it != deferred_dpcs.end(); ++it) {
+    if (it->second == dpc.guest_address()) {
+      deferred_dpcs.erase(it);
+      --deferred_dpc_count;
+      result = true;
+      break;
+    }
+  }
+
+  return result ? 1 : 0;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeRemoveQueueDpc, kThreading, kImplemented);
+
+// https://github.com/Cxbx-Reloaded/Cxbx-Reloaded/blob/51e4dfcaacfdbd1a9692272931a436371492f72d/import/OpenXDK/include/xboxkrnl/xboxkrnl.h#L1372
+struct X_ERWLOCK {
+  be<int32_t> lock_count;              // 0x0
+  be<uint32_t> writers_waiting_count;  // 0x4
+  be<uint32_t> readers_waiting_count;  // 0x8
+  be<uint32_t> readers_entry_count;    // 0xC
+  X_KEVENT writer_event;               // 0x10
+  X_KSEMAPHORE reader_semaphore;       // 0x20
+  X_KSPINLOCK spin_lock;               // 0x34
+};
+static_assert_size(X_ERWLOCK, 0x38);
+
+void ExInitializeReadWriteLock_entry(pointer_t<X_ERWLOCK> lock_ptr) {
+  lock_ptr->lock_count = -1;
+  lock_ptr->writers_waiting_count = 0;
+  lock_ptr->readers_waiting_count = 0;
+  lock_ptr->readers_entry_count = 0;
+  KeInitializeEvent_entry(&lock_ptr->writer_event, 1, 0);
+  KeInitializeSemaphore_entry(&lock_ptr->reader_semaphore, 0, 0x7FFFFFFF);
+  lock_ptr->spin_lock.prcb_of_owner = 0;
+}
+DECLARE_XBOXKRNL_EXPORT1(ExInitializeReadWriteLock, kThreading, kImplemented);
+
+void ExAcquireReadWriteLockExclusive_entry(pointer_t<X_ERWLOCK> lock_ptr,
+                                           const ppc_context_t& ppc_context) {
+  auto old_irql = xeKeKfAcquireSpinLock(ppc_context, &lock_ptr->spin_lock);
+
+  int32_t lock_count = ++lock_ptr->lock_count;
+  if (!lock_count) {
+    xeKeKfReleaseSpinLock(ppc_context, &lock_ptr->spin_lock, old_irql);
+    return;
+  }
+
+  lock_ptr->writers_waiting_count++;
+
+  xeKeKfReleaseSpinLock(ppc_context, &lock_ptr->spin_lock, old_irql);
+  xeKeWaitForSingleObject(&lock_ptr->writer_event, 7, 0, 0, nullptr);
+}
+DECLARE_XBOXKRNL_EXPORT2(ExAcquireReadWriteLockExclusive, kThreading,
+                         kImplemented, kBlocking);
+
+dword_result_t ExTryToAcquireReadWriteLockExclusive_entry(
+    pointer_t<X_ERWLOCK> lock_ptr, const ppc_context_t& ppc_context) {
+  auto old_irql = xeKeKfAcquireSpinLock(ppc_context, &lock_ptr->spin_lock);
+
+  uint32_t result;
+  if (lock_ptr->lock_count < 0) {
+    lock_ptr->lock_count = 0;
+    result = 1;
+  } else {
+    result = 0;
+  }
+
+  xeKeKfReleaseSpinLock(ppc_context, &lock_ptr->spin_lock, old_irql);
+  return result;
+}
+DECLARE_XBOXKRNL_EXPORT1(ExTryToAcquireReadWriteLockExclusive, kThreading,
+                         kImplemented);
+
+void ExAcquireReadWriteLockShared_entry(pointer_t<X_ERWLOCK> lock_ptr,
+                                        const ppc_context_t& ppc_context) {
+  auto old_irql = xeKeKfAcquireSpinLock(ppc_context, &lock_ptr->spin_lock);
+
+  int32_t lock_count = ++lock_ptr->lock_count;
+  if (!lock_count ||
+      (lock_ptr->readers_entry_count && !lock_ptr->writers_waiting_count)) {
+    lock_ptr->readers_entry_count++;
+    xeKeKfReleaseSpinLock(ppc_context, &lock_ptr->spin_lock, old_irql);
+    return;
+  }
+
+  lock_ptr->readers_waiting_count++;
+
+  xeKeKfReleaseSpinLock(ppc_context, &lock_ptr->spin_lock, old_irql);
+  xeKeWaitForSingleObject(&lock_ptr->reader_semaphore, 7, 0, 0, nullptr);
+}
+DECLARE_XBOXKRNL_EXPORT2(ExAcquireReadWriteLockShared, kThreading, kImplemented,
+                         kBlocking);
+
+dword_result_t ExTryToAcquireReadWriteLockShared_entry(
+    pointer_t<X_ERWLOCK> lock_ptr, const ppc_context_t& ppc_context) {
+  auto old_irql = xeKeKfAcquireSpinLock(ppc_context, &lock_ptr->spin_lock);
+
+  uint32_t result;
+  if (lock_ptr->lock_count < 0 ||
+      (lock_ptr->readers_entry_count && !lock_ptr->writers_waiting_count)) {
+    lock_ptr->lock_count++;
+    lock_ptr->readers_entry_count++;
+    result = 1;
+  } else {
+    result = 0;
+  }
+
+  xeKeKfReleaseSpinLock(ppc_context, &lock_ptr->spin_lock, old_irql);
+  return result;
+}
+DECLARE_XBOXKRNL_EXPORT1(ExTryToAcquireReadWriteLockShared, kThreading,
+                         kImplemented);
+
+void ExReleaseReadWriteLock_entry(pointer_t<X_ERWLOCK> lock_ptr,
+                                  const ppc_context_t& ppc_context) {
+  auto old_irql = xeKeKfAcquireSpinLock(ppc_context, &lock_ptr->spin_lock);
+
+  int32_t lock_count = --lock_ptr->lock_count;
+
+  if (lock_count < 0) {
+    lock_ptr->readers_entry_count = 0;
+    xeKeKfReleaseSpinLock(ppc_context, &lock_ptr->spin_lock, old_irql);
+    return;
+  }
+
+  if (!lock_ptr->readers_entry_count) {
+    // The exclusive owner is releasing, so hand the lock to the waiting
+    // readers, or else to a waiting writer.
+    auto readers_waiting_count = lock_ptr->readers_waiting_count;
+    if (readers_waiting_count) {
+      lock_ptr->readers_waiting_count = 0;
+      lock_ptr->readers_entry_count = readers_waiting_count;
+      xeKeKfReleaseSpinLock(ppc_context, &lock_ptr->spin_lock, old_irql);
+      xeKeReleaseSemaphore(&lock_ptr->reader_semaphore, 1,
+                           readers_waiting_count, 0);
+      return;
+    }
+  } else if (--lock_ptr->readers_entry_count) {
+    // Other readers still hold the lock.
+    xeKeKfReleaseSpinLock(ppc_context, &lock_ptr->spin_lock, old_irql);
+    return;
+  }
+
+  lock_ptr->writers_waiting_count--;
+  xeKeKfReleaseSpinLock(ppc_context, &lock_ptr->spin_lock, old_irql);
+  xeKeSetEvent(&lock_ptr->writer_event, 1, 0);
+}
+DECLARE_XBOXKRNL_EXPORT1(ExReleaseReadWriteLock, kThreading, kImplemented);
+
+// NOTE: This function is very commonly inlined, and probably won't be called!
+pointer_result_t InterlockedPushEntrySList_entry(
+    pointer_t<X_SLIST_HEADER> plist_ptr, pointer_t<X_SINGLE_LIST_ENTRY> entry) {
+  assert_not_null(plist_ptr);
+  assert_not_null(entry);
+
+  alignas(8) X_SLIST_HEADER old_hdr = *plist_ptr;
+  alignas(8) X_SLIST_HEADER new_hdr = {{0}, 0, 0};
+  uint32_t old_head = 0;
+  do {
+    old_hdr = *plist_ptr;
+    new_hdr.depth = old_hdr.depth + 1;
+    new_hdr.sequence = old_hdr.sequence + 1;
+
+    old_head = old_hdr.next.next;
+    entry->next = old_hdr.next.next;
+    new_hdr.next.next = entry.guest_address();
+  } while (
+      !xe::atomic_cas(*(uint64_t*)(&old_hdr), *(uint64_t*)(&new_hdr),
+                      reinterpret_cast<uint64_t*>(plist_ptr.host_address())));
+
+  return old_head;
+}
+DECLARE_XBOXKRNL_EXPORT2(InterlockedPushEntrySList, kThreading, kImplemented,
+                         kHighFrequency);
+
+pointer_result_t InterlockedPopEntrySList_entry(
+    pointer_t<X_SLIST_HEADER> plist_ptr) {
+  assert_not_null(plist_ptr);
+
+  uint32_t popped = 0;
+  alignas(8) X_SLIST_HEADER old_hdr = {{0}, 0, 0};
+  alignas(8) X_SLIST_HEADER new_hdr = {{0}, 0, 0};
+  do {
+    old_hdr = *plist_ptr;
+    auto next = kernel_memory()->TranslateVirtual<X_SINGLE_LIST_ENTRY*>(
+        old_hdr.next.next);
+    if (!old_hdr.next.next) {
+      return 0;
+    }
+    popped = old_hdr.next.next;
+
+    new_hdr.depth = old_hdr.depth - 1;
+    new_hdr.next.next = next->next;
+    new_hdr.sequence = old_hdr.sequence;
+  } while (
+      !xe::atomic_cas(*(uint64_t*)(&old_hdr), *(uint64_t*)(&new_hdr),
+                      reinterpret_cast<uint64_t*>(plist_ptr.host_address())));
+
+  return popped;
+}
+DECLARE_XBOXKRNL_EXPORT2(InterlockedPopEntrySList, kThreading, kImplemented,
+                         kHighFrequency);
+
+pointer_result_t InterlockedFlushSList_entry(
+    pointer_t<X_SLIST_HEADER> plist_ptr) {
+  assert_not_null(plist_ptr);
+
+  alignas(8) X_SLIST_HEADER old_hdr = *plist_ptr;
+  alignas(8) X_SLIST_HEADER new_hdr = {{0}, 0, 0};
+  uint32_t first = 0;
+  do {
+    old_hdr = *plist_ptr;
+    first = old_hdr.next.next;
+    new_hdr.next.next = 0;
+    new_hdr.depth = 0;
+    new_hdr.sequence = 0;
+  } while (
+      !xe::atomic_cas(*(uint64_t*)(&old_hdr), *(uint64_t*)(&new_hdr),
+                      reinterpret_cast<uint64_t*>(plist_ptr.host_address())));
+
+  return first;
+}
+DECLARE_XBOXKRNL_EXPORT1(InterlockedFlushSList, kThreading, kImplemented);
+
+dword_result_t KeSetPriorityThread_entry(pointer_t<X_KTHREAD> thread_ptr,
+                                         dword_t new_priority,
+                                         const ppc_context_t& context) {
+  if (!thread_ptr) {
+    XELOGE("{}: Invalid thread_ptr.", __func__);
+    return 0;
+  }
+
+  if (thread_ptr->header.type != ThreadObject) {
+    XELOGW("{}: Invalid object type: {}", __func__,
+           static_cast<uint8_t>(thread_ptr->header.type));
+  }
+
+  X_KPRCB* prcb = context->TranslateVirtual(thread_ptr->a_prcb_ptr);
+  const uint32_t old_irql = xeKeKfAcquireSpinLock(context, &prcb->spin_lock);
+  const uint8_t old_priority = thread_ptr->priority;
+
+  auto thread_ref = XObject::GetNativeObject<XThread>(kernel_state(),
+                                                      thread_ptr, ThreadObject);
+
+  if (!thread_ref) {
+    XELOGW("{}: Missing native thread: {}", __func__,
+           static_cast<uint8_t>(thread_ptr->header.type));
+  } else {
+    thread_ref->SetPriority(new_priority);
+  }
+
+  xeKeKfReleaseSpinLock(context, &prcb->spin_lock, old_irql);
+  return old_priority;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSetPriorityThread, kThreading, kImplemented);
+
+void xeKeInitializeTimerEx(X_KTIMER* timer, uint32_t type, uint32_t proctype,
+                           PPCContext* context) {
+  xenia_assert(proctype < 3);
+  xenia_assert(type == 0 || type == 1);
+  // other fields are unmodified, they must carry through multiple calls of
+  // initialize
+  timer->header.process_type = proctype;
+  timer->header.inserted = 0;
+  timer->header.type =
+      type ? TimerSynchronizationObject : TimerNotificationObject;
+  timer->header.signal_state = 0;
+  util::XeInitializeListHead(&timer->header.wait_list, context);
+  timer->due_time = 0;
+  timer->period = 0;
+}
+
+void KeInitializeTimerEx_entry(pointer_t<X_KTIMER> timer, dword_t type,
+                               dword_t proctype, const ppc_context_t& context) {
+  xeKeInitializeTimerEx(timer, type, proctype & 0xFF, context);
+}
+DECLARE_XBOXKRNL_EXPORT1(KeInitializeTimerEx, kThreading, kImplemented);
+
+// Returns whether the timer was already set.
+dword_result_t KeSetTimerEx_entry(pointer_t<X_KTIMER> timer, qword_t due_time,
+                                  dword_t period_ms, pointer_t<XDPC> dpc) {
+  auto native = XObject::GetNativeObject<XTimer>(kernel_state(), timer);
+  if (!native) {
+    return 0;
+  }
+  // Cancelled first, so an expiry of the previous setting can't overwrite the
+  // new one.
+  native->Cancel();
+  // Its expiry queues a DPC targeted at a processor on that processor's DPC
+  // thread, which only guest code can start.
+  if (dpc && dpc->desired_cpu_number && dpc->desired_cpu_number <= 6) {
+    kernel_state()->StartProcessorDpcThread(dpc->desired_cpu_number - 1);
+  }
+  const uint32_t was_set = timer->header.inserted;
+  timer->header.inserted = 1;
+  timer->header.signal_state = 0;
+  timer->due_time = uint64_t(due_time);
+  timer->period = uint32_t(period_ms);
+  timer->dpc = dpc.guest_address();
+  native->SetTimer(int64_t(uint64_t(due_time)), period_ms, 0, 0, false,
+                   dpc.guest_address());
+  return was_set;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSetTimerEx, kThreading, kImplemented);
+
+// Returns whether the timer was set.
+dword_result_t KeCancelTimer_entry(pointer_t<X_KTIMER> timer) {
+  const uint32_t was_set = timer->header.inserted;
+  if (was_set) {
+    if (auto native = XObject::GetNativeObject<XTimer>(kernel_state(), timer)) {
+      native->Cancel();
+    }
+  }
+  timer->header.inserted = 0;
+  return was_set;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeCancelTimer, kThreading, kImplemented);
+
+dword_result_t KeSetTimer_entry(pointer_t<X_KTIMER> timer, qword_t due_time,
+                                pointer_t<XDPC> dpc) {
+  return KeSetTimerEx_entry(timer, due_time, 0, dpc);
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSetTimer, kThreading, kImplemented);
+
+void KeInitializeMutant_entry(pointer_t<X_KMUTANT> mutant,
+                              dword_t initial_owner) {
+  mutant.Zero();
+  mutant->header.type = X_OBJECT_TYPES::MutantObject;
+  mutant->header.signal_state = initial_owner ? 0 : 1;
+  // Created now so an initial owner is the calling thread.
+  XObject::GetNativeObject<XMutant>(kernel_state(), mutant);
+}
+DECLARE_XBOXKRNL_EXPORT1(KeInitializeMutant, kThreading, kImplemented);
+
+// Returns the previous signal state.
+dword_result_t KeReleaseMutant_entry(pointer_t<X_KMUTANT> mutant,
+                                     dword_t priority_increment,
+                                     dword_t abandon, dword_t wait) {
+  const int32_t previous = int32_t(uint32_t(mutant->header.signal_state));
+  if (auto native = XObject::GetNativeObject<XMutant>(kernel_state(), mutant)) {
+    native->ReleaseMutant(priority_increment, !!abandon, !!wait);
+  }
+  return previous;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeReleaseMutant, kThreading, kImplemented);
+
+}  // namespace xboxkrnl
+}  // namespace kernel
+}  // namespace xe
+
+DECLARE_XBOXKRNL_EMPTY_REGISTER_EXPORTS(Threading);

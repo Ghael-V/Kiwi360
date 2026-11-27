@@ -1,0 +1,13 @@
+Kiwi360
+Copyright 2026 Kiwi360 Project
+
+Kiwi360's own code is licensed under the PolyForm Shield License 1.0.0:
+https://polyformproject.org/licenses/shield/1.0.0
+
+Required Notice: Copyright 2026 Kiwi360 Project
+
+Kiwi360 is based on Xenia and Xenia Edge. Their code, and every other
+third-party component listed below, remains under its own license.
+
+Xbox and Xbox 360 are trademarks of Microsoft. Kiwi360 is not affiliated
+with or endorsed by Microsoft.

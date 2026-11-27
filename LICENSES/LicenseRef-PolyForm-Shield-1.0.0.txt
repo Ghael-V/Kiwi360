@@ -1,0 +1,14 @@
+Kiwi360
+Copyright 2026 Kiwi360 Project
+
+The Kiwi360 files in this tree, those carrying
+"SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0", are licensed
+under the PolyForm Shield License 1.0.0:
+https://polyformproject.org/licenses/shield/1.0.0
+
+Required Notice: Copyright 2026 Kiwi360 Project
+
+Everything else here, including Kiwi360's changes to Xenia's own files,
+remains under Xenia's license (LICENSE, BSD-3-Clause) or the license of each
+third-party component. third_party/mspack/kiwi_android_log.c is MIT, as part
+of the LGPL-2.1 libmspack library.

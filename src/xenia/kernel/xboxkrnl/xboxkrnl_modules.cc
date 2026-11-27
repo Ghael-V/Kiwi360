@@ -1,0 +1,479 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+#include "xenia/kernel/xboxkrnl/xboxkrnl_modules.h"
+#include "xenia/base/logging.h"
+#include "xenia/cpu/xex_module.h"
+#include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/user_module.h"
+#include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
+#include "xenia/xbox.h"
+
+DECLARE_int32(console_type);
+
+namespace xe {
+namespace kernel {
+namespace xboxkrnl {
+
+static bool HasExecutablePrivilege(uint32_t privilege) {
+  // Privilege is bit position in xe_xex2_system_flags enum - so:
+  // Privilege=6 -> 0x00000040 -> XEX_SYSTEM_INSECURE_SOCKETS
+  uint32_t mask = 1 << privilege;
+
+  auto module = kernel_state()->GetExecutableModule();
+  if (!module) {
+    return false;
+  }
+
+  uint32_t flags = 0;
+  module->GetOptHeader<uint32_t>(XEX_HEADER_SYSTEM_FLAGS, &flags);
+
+  return (flags & mask) > 0;
+}
+
+dword_result_t XexCheckExecutablePrivilege_entry(dword_t privilege) {
+  // BOOL
+  // DWORD Privilege
+  return HasExecutablePrivilege(privilege);
+}
+DECLARE_XBOXKRNL_EXPORT1(XexCheckExecutablePrivilege, kModules, kImplemented);
+
+// Takes the signed part of an XEX2 header's security info, from its RSA
+// signature on. The hypervisor checks it and decrypts its image key in place,
+// which the dashboard needs to read a disc's executable.
+dword_result_t XexTransformImageKey_entry(lpvoid_t security_info,
+                                          dword_t size) {
+  constexpr uint32_t kImageKeyOffset =
+      offsetof(xex2_security_info, aes_key) -
+      offsetof(xex2_security_info, rsa_signature);
+  if (!HasExecutablePrivilege(0)) {
+    return X_STATUS_ACCESS_DENIED;
+  }
+  if (!security_info || size < kImageKeyOffset + 0x10) {
+    return X_STATUS_TOO_MANY_SECRETS;
+  }
+  uint8_t* key = security_info.as<uint8_t*>() + kImageKeyOffset;
+  cpu::DecryptXex2ImageKey(key, key);
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(XexTransformImageKey, kModules, kImplemented);
+
+dword_result_t XexGetModuleHandle(std::string module_name,
+                                  xe::be<uint32_t>* hmodule_ptr) {
+  object_ref<XModule> module;
+
+  if (module_name.empty()) {
+    module = kernel_state()->GetExecutableModule();
+  } else {
+    module = kernel_state()->GetModule(module_name);
+  }
+
+  if (!module) {
+    *hmodule_ptr = 0;
+    return X_ERROR_NOT_FOUND;
+  }
+
+  // NOTE: we don't retain the handle for return.
+  *hmodule_ptr = module->hmodule_ptr();
+
+  return X_ERROR_SUCCESS;
+}
+
+dword_result_t XexGetModuleHandle_entry(lpstring_t module_name,
+                                        lpdword_t hmodule_ptr) {
+  return XexGetModuleHandle(module_name ? module_name.value() : "",
+                            hmodule_ptr);
+}
+DECLARE_XBOXKRNL_EXPORT1(XexGetModuleHandle, kModules, kImplemented);
+
+dword_result_t XexGetModuleSection_entry(lpvoid_t hmodule, lpstring_t name,
+                                         lpdword_t data_ptr,
+                                         lpdword_t size_ptr) {
+  X_STATUS result = X_STATUS_SUCCESS;
+
+  auto module = XModule::GetFromHModule(kernel_state(), hmodule);
+  if (module) {
+    uint32_t section_data = 0;
+    uint32_t section_size = 0;
+    result = module->GetSection(name.value(), &section_data, &section_size);
+    if (XSUCCEEDED(result)) {
+      *data_ptr = section_data;
+      *size_ptr = section_size;
+    }
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+
+  return result;
+}
+DECLARE_XBOXKRNL_EXPORT1(XexGetModuleSection, kModules, kImplemented);
+
+// Executable memory for code a title generates at run time. In the retail
+// kernel (2.0.17559, xboxkrnl.exe 0x8007BB68) both ordinals are one stub that
+// returns STATUS_INVALID_SYSTEM_SERVICE, and 2.0.1888 doesn't export them:
+// only a devkit kernel implements them. The Silverlight CLR (xcoreclr.dll)
+// calls XexReserveCodeBuffer on the range between two exports of its
+// CLRCodeCachedll_N.xex before carving stubs from it, and treats the failure
+// as out of memory, which is what a retail console does; it only tries when
+// xbdm.xex is loaded, so a devkit (console_type >= 0) gets the devkit
+// behaviour. Guest memory here is executable wherever it is, so there is
+// nothing to reserve or commit.
+dword_result_t XexReserveCodeBuffer_entry(lpdword_t buffer_ptr, dword_t size) {
+  return cvars::console_type >= 0 ? X_STATUS_SUCCESS
+                                  : X_STATUS_INVALID_SYSTEM_SERVICE;
+}
+DECLARE_XBOXKRNL_EXPORT1(XexReserveCodeBuffer, kModules, kStub);
+
+dword_result_t XexCommitCodeBuffer_entry(lpdword_t buffer_ptr, dword_t size) {
+  return cvars::console_type >= 0 ? X_STATUS_SUCCESS
+                                  : X_STATUS_INVALID_SYSTEM_SERVICE;
+}
+DECLARE_XBOXKRNL_EXPORT1(XexCommitCodeBuffer, kModules, kStub);
+
+// Returns the image base of the module containing pc (callers pass it to
+// RtlImageDirectoryEntryToData to find .pdata) and stores its loader entry. A
+// pc in no module returns 0 and leaves ldr_data_ptr alone. The kernel also
+// finds its own modules, which have no guest image here.
+dword_result_t XexPcToFileHeader_entry(dword_t pc, lpdword_t ldr_data_ptr) {
+  auto module = kernel_state()->GetUserModuleForAddress(pc);
+  if (!module) {
+    return 0;
+  }
+  if (ldr_data_ptr) {
+    *ldr_data_ptr = module->hmodule_ptr();
+  }
+  return module->xex_module()->base_address();
+}
+DECLARE_XBOXKRNL_EXPORT1(XexPcToFileHeader, kModules, kImplemented);
+
+inline const std::map<X_MODULE_FLAGS, std::string> xex_load_image_map = {
+    {TITLE_PROCESS, "Title Process"},
+    {TITLE_IMPORT, "Title Import"},
+    {DEBUGGER, "Debugger Loaded"},
+    {LOAD_DLL, "Load DLL"},
+    {LOAD_PATCH, "Load Patch"},
+    {LOAD_FULL_PATCH, "Load Full Patch"},
+    {LOAD_DELTA_PATCH, "Load Delta Patch"},
+    {BOUND_PATH, "Load By Bound Path"},
+    {SILENT_LOAD, "Load Silently"}};
+
+// Takes a reference to the module |module_name| names, loading it with
+// |load_callback| first when it isn't loaded. Returns its hmodule, or 0.
+static uint32_t LoadImageReference(
+    const std::string_view module_name,
+    const std::function<object_ref<UserModule>()>& load_callback) {
+  // The console's XexLoadImage (0x8007D6E8) holds the loader lock from the
+  // lookup through DLL_PROCESS_ATTACH, so an unload can't take the module away
+  // in between.
+  KernelState::LoaderLockScope loader_lock(kernel_state());
+  uint32_t hmodule = 0;
+  if (auto module = kernel_state()->GetModule(module_name)) {
+    // One more load for XexUnloadImage to undo. A module loaded here starts
+    // at one.
+    hmodule = module->hmodule_ptr();
+    if (hmodule) {
+      kernel_memory()
+          ->TranslateVirtual<X_LDR_DATA_TABLE_ENTRY*>(hmodule)
+          ->load_count++;
+    }
+  } else if (auto user_module = load_callback()) {
+    // The executable runs with the update, which a module without it doesn't
+    // match.
+    if (XFAILED(kernel_state()->ApplyTitleUpdate(user_module))) {
+      xe::FatalError(fmt::format(
+          "The title update failed to apply to {}, which the updated game "
+          "can't run without.\n\nRemove the title update or turn off "
+          "apply_title_update for this game. xenia.log has the details.",
+          xe::utf8::find_name_from_guest_path(module_name)));
+    }
+    kernel_state()->FinishLoadingUserModule(user_module);
+    // Give up object ownership, this reference will be released by the last
+    // XexUnloadImage call
+    hmodule = user_module.release()->hmodule_ptr();
+  }
+  return hmodule;
+}
+
+uint32_t xeXexLoadImage(const std::string_view module_name) {
+  return LoadImageReference(module_name, [module_name] {
+    return kernel_state()->LoadUserModule(module_name);
+  });
+}
+
+dword_result_t xeXexLoadImage(
+    lpstring_t module_name, dword_t module_flags, dword_t min_version,
+    lpdword_t hmodule_ptr,
+    const std::function<object_ref<UserModule>()>& load_callback,
+    bool isFromMemory, const X_STATUS* load_status) {
+  std::string summary = "Loading Xex Image:";
+  uint32_t unused_flag = module_flags;
+
+  for (const auto& entry : xex_load_image_map) {
+    if (module_flags & entry.first) {
+      summary += fmt::format(" {},", entry.second);
+      unused_flag &= ~entry.first;
+    }
+  }
+  if (unused_flag) {
+    summary += fmt::format(" Unk flag: {:08X}", unused_flag);
+  }
+  XELOGD("{}", summary);
+
+  if (!hmodule_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  if (isFromMemory && kernel_state()->GetModule(module_name.value())) {
+    // Existing module found; return error status.
+    *hmodule_ptr = 0;
+    return X_STATUS_OBJECT_NAME_COLLISION;
+  }
+  const uint32_t hmodule =
+      LoadImageReference(module_name.value(), load_callback);
+  *hmodule_ptr = hmodule;
+  if (hmodule) {
+    return X_STATUS_SUCCESS;
+  }
+  return load_status ? *load_status : X_STATUS_NO_SUCH_FILE;
+}
+
+dword_result_t XexLoadImage_entry(lpstring_t module_name, dword_t module_flags,
+                                  dword_t min_version, lpdword_t hmodule_ptr,
+                                  const ppc_context_t& context) {
+  // Only a DLL loads this way, or a load with flag 0x80, which has no name.
+  // Anything else is refused before the module is looked for.
+  if (!(module_flags & (LOAD_DLL | 0x80))) {
+    return X_STATUS_ACCESS_DENIED;
+  }
+  if (hmodule_ptr) {
+    *hmodule_ptr = 0;
+  }
+  // A module goes into the title process with TITLE_PROCESS and into the
+  // system process without it, which only a thread of that process loads
+  // into.
+  if (!(module_flags & TITLE_PROCESS) &&
+      xeKeGetCurrentProcessType(context) != X_PROCTYPE_SYSTEM) {
+    return X_STATUS_ACCESS_DENIED;
+  }
+  // A module that isn't there fails as opening its file would.
+  X_STATUS load_status = X_STATUS_NO_SUCH_FILE;
+  auto load_callback = [module_name, &load_status] {
+    return kernel_state()->LoadUserModule(module_name.value(), true,
+                                          &load_status);
+  };
+  return xeXexLoadImage(module_name, module_flags, min_version, hmodule_ptr,
+                        load_callback, false, &load_status);
+}
+DECLARE_XBOXKRNL_EXPORT1(XexLoadImage, kModules, kImplemented);
+
+dword_result_t XexLoadImageFromMemory_entry(lpdword_t buffer, dword_t size,
+                                            lpstring_t module_name,
+                                            dword_t module_flags,
+                                            dword_t min_version,
+                                            lpdword_t hmodule_ptr) {
+  auto load_callback = [module_name, buffer, size] {
+    return kernel_state()->LoadUserModuleFromMemory(module_name.value(), buffer,
+                                                    size);
+  };
+  return xeXexLoadImage(module_name, module_flags, min_version, hmodule_ptr,
+                        load_callback, true, nullptr);
+}
+DECLARE_XBOXKRNL_EXPORT1(XexLoadImageFromMemory, kModules, kImplemented);
+
+dword_result_t XexLoadExecutable_entry(lpstring_t module_name,
+                                       dword_t module_flags,
+                                       dword_t min_version,
+                                       lpdword_t hmodule_ptr,
+                                       const ppc_context_t& context) {
+  return XexLoadImage_entry(module_name, module_flags, min_version, hmodule_ptr,
+                            context);
+}
+DECLARE_XBOXKRNL_EXPORT1(XexLoadExecutable, kModules, kSketchy);
+
+X_STATUS xeXexUnloadImage(uint32_t hmodule) {
+  if (!hmodule) {
+    return X_STATUS_INVALID_HANDLE;
+  }
+  auto ldr_data =
+      kernel_memory()->TranslateVirtual<X_LDR_DATA_TABLE_ENTRY*>(hmodule);
+  auto module = XModule::GetFromHModule(kernel_state(), ldr_data);
+  if (!module) {
+    return X_STATUS_INVALID_HANDLE;
+  }
+
+  // Can't unload kernel modules from user code.
+  if (module->module_type() != XModule::ModuleType::kKernelModule) {
+    // As XexUnloadImage (0x8007D0E8) does, the last reference goes and the
+    // module detaches and leaves the list under the loader lock.
+    KernelState::LoaderLockScope loader_lock(kernel_state());
+    if (--ldr_data->load_count == 0) {
+      // No more references, free it.
+      module->Release();
+      kernel_state()->UnloadUserModule(object_ref<UserModule>(
+          reinterpret_cast<UserModule*>(module.release())));
+    }
+  }
+
+  return X_STATUS_SUCCESS;
+}
+
+dword_result_t XexUnloadImage_entry(lpvoid_t hmodule) {
+  return xeXexUnloadImage(hmodule.guest_address());
+}
+DECLARE_XBOXKRNL_EXPORT1(XexUnloadImage, kModules, kImplemented);
+
+dword_result_t XexGetProcedureAddress_entry(lpvoid_t hmodule, dword_t ordinal,
+                                            lpdword_t out_function_ptr) {
+  // May be entry point?
+  assert_not_zero(ordinal);
+
+  bool is_string_name = (ordinal & 0xFFFF0000) != 0;
+  auto string_name =
+      reinterpret_cast<const char*>(kernel_memory()->TranslateVirtual(ordinal));
+
+  X_STATUS result = X_STATUS_INVALID_HANDLE;
+
+  object_ref<XModule> module;
+  if (!hmodule) {
+    module = kernel_state()->GetExecutableModule();
+  } else {
+    module = XModule::GetFromHModule(kernel_state(), hmodule);
+  }
+  if (module) {
+    uint32_t ptr;
+    if (is_string_name) {
+      ptr = module->GetProcAddressByName(string_name);
+    } else {
+      ptr = module->GetProcAddressByOrdinal(ordinal);
+    }
+    if (ptr) {
+      *out_function_ptr = ptr;
+      result = X_STATUS_SUCCESS;
+    } else {
+      if (is_string_name) {
+        XELOGW("ERROR: XexGetProcedureAddress export '{}' in '{}' not found!",
+               string_name, module->name());
+      } else {
+        XELOGW(
+            "ERROR: XexGetProcedureAddress ordinal {} (0x{:X}) in '{}' not "
+            "found!",
+            static_cast<uint32_t>(ordinal), static_cast<uint32_t>(ordinal),
+            module->name());
+      }
+      *out_function_ptr = 0;
+      result = X_STATUS_DRIVER_ENTRYPOINT_NOT_FOUND;
+    }
+  }
+
+  return result;
+}
+DECLARE_XBOXKRNL_EXPORT1(XexGetProcedureAddress, kModules, kImplemented);
+
+void ExRegisterTitleTerminateNotification_entry(
+    pointer_t<X_EX_TITLE_TERMINATE_REGISTRATION> reg, dword_t create) {
+  if (create) {
+    // Adding.
+    kernel_state()->RegisterTitleTerminateNotification(
+        reg->notification_routine, reg->priority);
+  } else {
+    // Removing.
+    kernel_state()->RemoveTitleTerminateNotification(reg->notification_routine);
+  }
+}
+DECLARE_XBOXKRNL_EXPORT1(ExRegisterTitleTerminateNotification, kModules,
+                         kImplemented);
+// todo: replace magic numbers
+dword_result_t XexLoadImageHeaders_entry(pointer_t<X_ANSI_STRING> path,
+                                         pointer_t<xex2_header> header,
+                                         dword_t buffer_size,
+                                         const ppc_context_t& ctx) {
+  if (buffer_size < 0x800) {
+    return X_STATUS_BUFFER_TOO_SMALL;
+  }
+  auto current_kernel = ctx->kernel_state;
+  auto target_path = util::TranslateAnsiPath(current_kernel->memory(), path);
+
+  vfs::File* vfs_file = nullptr;
+  vfs::FileAction file_action;
+  X_STATUS result = current_kernel->file_system()->OpenFile(
+      nullptr, target_path, vfs::FileDisposition::kOpen,
+      vfs::FileAccess::kGenericRead, false, true, &vfs_file, &file_action);
+
+  if (!vfs_file) {
+    return result;
+  }
+  size_t bytes_read = 0;
+
+  X_STATUS result_status = vfs_file->ReadSync(
+      std::span<uint8_t>(reinterpret_cast<uint8_t*>(header.host_address()),
+                         2048),
+      0, &bytes_read);
+
+  if (result_status < 0) {
+    vfs_file->Destroy();
+    return result_status;
+  }
+
+  if (header->magic != 'XEX2') {
+    vfs_file->Destroy();
+    return X_STATUS_INVALID_IMAGE_FORMAT;
+  }
+  unsigned int header_size = header->header_size;
+
+  if (header_size < 0x800 || header_size > 0x10000 ||
+      (header_size & 0x7FF) != 0) {
+    result_status = X_STATUS_INVALID_IMAGE_FORMAT;
+  } else if (header_size <= buffer_size) {
+    if (header_size <= 0x800) {
+      result_status = X_STATUS_SUCCESS;
+    } else {
+      result_status = vfs_file->ReadSync(
+          std::span<uint8_t>(
+              reinterpret_cast<uint8_t*>(header.host_address() + 2048),
+              header_size - 2048),
+          2048, &bytes_read);
+      if (result_status >= X_STATUS_SUCCESS) {
+        result_status = X_STATUS_SUCCESS;
+      }
+    }
+
+  } else {
+    result_status = X_STATUS_BUFFER_TOO_SMALL;
+  }
+
+  // The security info's offset becomes its address in the buffer, which is
+  // how titles reach it.
+  if (result_status == X_STATUS_SUCCESS) {
+    const uint32_t security_offset = header->security_offset;
+    const uint32_t remaining =
+        security_offset < header_size ? header_size - security_offset : 0;
+    const uint8_t* data = reinterpret_cast<uint8_t*>(header.host_address());
+    const uint32_t security_size =
+        remaining >= 4 ? xe::load_and_swap<uint32_t>(data + security_offset)
+                       : 0;
+    // At least everything before the page descriptors.
+    if (security_size < 0x184 || security_size > remaining) {
+      result_status = X_STATUS_INVALID_IMAGE_FORMAT;
+    } else {
+      header->security_offset = header.guest_address() + security_offset;
+    }
+  }
+
+  vfs_file->Destroy();
+  return result_status;
+}
+DECLARE_XBOXKRNL_EXPORT1(XexLoadImageHeaders, kModules, kImplemented);
+
+}  // namespace xboxkrnl
+}  // namespace kernel
+}  // namespace xe
+
+DECLARE_XBOXKRNL_EMPTY_REGISTER_EXPORTS(Module);

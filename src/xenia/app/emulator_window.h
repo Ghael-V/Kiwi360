@@ -1,0 +1,382 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+#ifndef XENIA_APP_EMULATOR_WINDOW_H_
+#define XENIA_APP_EMULATOR_WINDOW_H_
+
+#include <atomic>
+#include <memory>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+#include "xenia/app/game_library.h"
+#include "xenia/emulator.h"
+#include "xenia/gpu/command_processor.h"
+#include "xenia/kernel/xam/indie_game.h"
+#include "xenia/ui/imgui_audio_dialog.h"
+#include "xenia/ui/imgui_confirm_dialog.h"
+#include "xenia/ui/imgui_context_menu.h"
+#include "xenia/ui/imgui_debug_dialog.h"
+#include "xenia/ui/imgui_dialog.h"
+#include "xenia/ui/imgui_drawer.h"
+#include "xenia/ui/imgui_music_dialog.h"
+#include "xenia/ui/imgui_performance_dialog.h"
+#include "xenia/ui/imgui_postprocessing_dialog.h"
+#include "xenia/ui/immediate_drawer.h"
+#include "xenia/ui/menu_item.h"
+#include "xenia/ui/presenter.h"
+#include "xenia/ui/profile_dialogs.h"
+#include "xenia/ui/window.h"
+#include "xenia/ui/window_listener.h"
+#include "xenia/ui/windowed_app_context.h"
+#include "xenia/xbox.h"
+
+class wxTimer;
+
+namespace xe {
+namespace kernel {
+namespace xam {
+class DashMouse;
+}  // namespace xam
+}  // namespace kernel
+namespace app {
+
+class GameListPanel;
+struct WxToolbarState;
+
+class EmulatorWindow {
+ public:
+  using steady_clock = std::chrono::steady_clock;  // stdlib steady clock
+
+  enum : size_t {
+    // The UI is on top of the game and is open in special cases, so
+    // lowest-priority.
+    kZOrderHidInput,
+    kZOrderImGui,
+    kZOrderProfiler,
+    // Emulator window controls are expected to be always accessible by the
+    // user, so highest-priority.
+    kZOrderEmulatorWindowInput,
+  };
+
+  virtual ~EmulatorWindow();
+
+  static std::unique_ptr<EmulatorWindow> Create(
+      Emulator* emulator, ui::WindowedAppContext& app_context, uint32_t width,
+      uint32_t height);
+
+  std::unique_ptr<xe::threading::Thread> gamepad_poll_thread_;
+  std::atomic<bool> gamepad_poll_running_ = {false};
+
+  static constexpr int64_t diff_in_ms(
+      const steady_clock::time_point t1,
+      const steady_clock::time_point t2) noexcept {
+    using ms = std::chrono::milliseconds;
+    return std::chrono::duration_cast<ms>(t1 - t2).count();
+  }
+
+  steady_clock::time_point last_mouse_up = steady_clock::now();
+  steady_clock::time_point last_mouse_down = steady_clock::now();
+
+  Emulator* emulator() const { return emulator_; }
+  GameLibrary* game_library() const { return game_library_.get(); }
+  ui::WindowedAppContext& app_context() const { return app_context_; }
+  ui::Window* window() const { return window_.get(); }
+  ui::ImGuiDrawer* imgui_drawer() const { return imgui_drawer_.get(); }
+
+  ui::Presenter* GetGraphicsSystemPresenter() const;
+  void SetupGraphicsSystemPresenterPainting();
+  void ShutdownGraphicsSystemPresenterPainting();
+
+  void OnEmulatorInitialized();
+
+  // Starts a new xenia process continuing this session with |args|, then
+  // |target| (UTF-8, empty for the game list). Returns whether it started.
+  bool SpawnEmulatorProcess(const std::vector<std::string>& args,
+                            const std::string& target);
+  // With |boot_animation| the boot animation plays before the title starts.
+  void LaunchTitleInNewProcess(const std::filesystem::path& path_to_file,
+                               bool boot_animation = false);
+  xe::X_STATUS RunTitle(const std::filesystem::path& path_to_file,
+                        bool boot_animation = false);
+  // Offers the title update dialog before the game at |path| starts when a
+  // newer update is known for its release, or some are for its other releases
+  // while none is installed. The game's config has to be loaded first, since it
+  // can turn the offer off.
+  void OfferTitleUpdate(const std::filesystem::path& path);
+  // Notes a title the update index lists while none of its updates is
+  // installed, whether or not the offer is on.
+  void NoteMissingTitleUpdate(uint32_t title_id);
+  void UpdateTitle();
+
+  void SetFullscreen(bool fullscreen);
+  void ToggleFullscreen();
+  void SetInitializingShaderStorage(bool initializing);
+  void SetCompilingShaders(bool compiling);
+
+  void TakeScreenshot();
+  void ExportScreenshot(const xe::ui::RawImage& image);
+  void SaveImage(const std::filesystem::path& path,
+                 const xe::ui::RawImage& image);
+
+  void ToggleProfilesConfigDialog();
+  void ToggleAudioDialog();
+  void ToggleMusicDialog();
+  void ToggleConfigDialog();
+  void OpenConfigDialog(const std::string& category = "");
+  void ToggleControllerVibration();
+  void FileOpen();
+  // Asks for a title or disc image to run, or returns an empty path.
+  std::filesystem::path PickTitleFile();
+  void FileAddGames();
+  // Starts the installed dashboard after the boot animation.
+  void StartDashboard();
+  std::filesystem::path GetInstalledDashboardPath() const;
+  // Whether a title leaves for the dashboard rather than the game list.
+  bool DashboardIsHome() const;
+  // Tells the user which XeFu file an original Xbox game was missing and where
+  // to put it.
+  void ShowMissingXeFuFile(const std::string& file);
+
+  // Helper methods for updating cvars from config dialogs.
+  void UpdateAntiAliasingCvar(gpu::CommandProcessor::SwapPostEffect effect);
+  void UpdateScalingAndSharpeningCvar(
+      ui::Presenter::GuestOutputPaintConfig::Effect effect);
+  void UpdateFsrSharpnessCvar(float value);
+  void UpdateFsrMaxUpsamplingPassesCvar(uint32_t value);
+  void UpdateCasSharpnessCvar(float value);
+  void UpdateDitherCvar(bool value);
+
+  // For comparisons, use GetSwapPostEffectForCvarValue instead as the default
+  // fallback may be used for multiple values.
+  static const char* GetCvarValueForSwapPostEffect(
+      gpu::CommandProcessor::SwapPostEffect effect);
+  static gpu::CommandProcessor::SwapPostEffect GetSwapPostEffectForCvarValue(
+      const std::string& cvar_value);
+  // For comparisons, use GetGuestOutputPaintEffectForCvarValue instead as the
+  // default fallback may be used for multiple values.
+  static const char* GetCvarValueForGuestOutputPaintEffect(
+      ui::Presenter::GuestOutputPaintConfig::Effect effect);
+  static ui::Presenter::GuestOutputPaintConfig::Effect
+  GetGuestOutputPaintEffectForCvarValue(const std::string& cvar_value);
+  static ui::Presenter::GuestOutputPaintConfig
+  GetGuestOutputPaintConfigForCvars();
+  void ApplyDisplayConfigForCvars();
+
+ private:
+  class EmulatorWindowListener final : public ui::WindowListener,
+                                       public ui::WindowInputListener {
+   public:
+    explicit EmulatorWindowListener(EmulatorWindow& emulator_window)
+        : emulator_window_(emulator_window) {}
+
+    void OnClosing(ui::UIEvent& e) override;
+    void OnFileDrop(ui::FileDropEvent& e) override;
+    void OnResize(ui::UISetupEvent& e) override;
+
+    void OnKeyDown(ui::KeyEvent& e) override;
+
+    void OnMouseDown(ui::MouseEvent& e) override;
+    void OnMouseUp(ui::MouseEvent& e) override;
+    void OnMouseDoubleClick(ui::MouseEvent& e) override;
+    void OnMouseMove(ui::MouseEvent& e) override;
+    void OnMouseWheel(ui::MouseEvent& e) override;
+    void OnLostFocus(ui::UISetupEvent& e) override;
+    void OnUsbDeviceChanged(bool is_arrival) override;
+
+   private:
+    EmulatorWindow& emulator_window_;
+  };
+
+  explicit EmulatorWindow(Emulator* emulator,
+                          ui::WindowedAppContext& app_context, uint32_t width,
+                          uint32_t height);
+
+  bool Initialize();
+
+  // Builds game_library_, running the one-time GPD->library migration if
+  // needed.
+  void InitializeGameLibrary();
+  // Gives the core the library releases the dashboard lists as its games.
+  void PublishLibraryTitles();
+
+  // Registers a just-launched title in the library so games opened outside the
+  // import flow still appear in the list.
+  void AddLaunchedTitleToLibrary(uint32_t title_id, const std::string& name);
+  // Lists each installed indie game the library doesn't have yet and drops the
+  // XNA title launcher's entries, returning whether the library changed.
+  bool AddInstalledIndieGamesToLibrary();
+  // Gives an indie game's release its package's icon when it has none.
+  void SetIndieGameIcon(const kernel::xam::IndieGame& game);
+  // Records the disc a title was launched from as its release's default and
+  // stamps the release as played. Empty when the library declined the disc.
+  std::optional<LibraryKey> RecordLaunchedDisc(
+      uint32_t title_id, const std::string& name,
+      const std::filesystem::path& path);
+
+  // Keeps the title's frame rate current until the title shuts down.
+  void StartFrameRateTimer();
+
+  void OnKeyDown(ui::KeyEvent& e);
+  void OnMouseDown(const ui::MouseEvent& e);
+  void OnMouseDoubleClick(ui::MouseEvent& e);
+  void FileDrop(const std::filesystem::path& filename);
+  void OnMouseUp(const ui::MouseEvent& e);
+  void OnMouseMove(const ui::MouseEvent& e);
+  void OnMouseWheel(const ui::MouseEvent& e);
+  // The dashboard's mouse input, while it takes the game window's mouse.
+  kernel::xam::DashMouse* GetDashMouse() const;
+  bool HasOpenDialogs() const;
+  // The mouse as fractions of the guest output, clamped to it, with whether
+  // it's over the output.
+  bool GetGuestOutputMousePosition(const ui::MouseEvent& e, float& x_out,
+                                   float& y_out, bool& inside_out) const;
+  void FileClose();
+  void UpdateAddGamesMenuState();
+  void UpdateStartDashboardMenuState();
+  void InstallContent();
+  void DownloadSystemFiles();
+  void SelectSystemFiles();
+  // Whether there are no system files to replace or the user chose to.
+  bool ConfirmReplaceSystemFiles();
+  // Whether the system files were installed.
+  bool InstallSystemFiles(const std::filesystem::path& zip_path);
+  void DownloadCoverArt();
+  void ShowContentDirectory();
+  void CpuTimeScalarReset();
+  void CpuTimeScalarSetHalf();
+  void CpuTimeScalarSetDouble();
+  void CpuBreakIntoDebugger();
+  void CpuBreakIntoHostDebugger();
+  void GpuTraceFrame();
+  void GpuClearCaches();
+  void ToggleDisplayConfigDialog();
+  void TogglePerformanceTuningDialog();
+  void ToggleDebugSettingsDialog();
+  void ToggleContextMenu(bool use_cursor_position = true);
+  void ShowCompatibility();
+  void ShowFAQ();
+  void ShowBuildCommit();
+  void ShowAbout();
+
+  void PollGamepads();
+
+  static std::string CanonicalizeFileExtension(
+      const std::filesystem::path& path);
+
+  // Get initial directory for file pickers based on most recently played game
+  std::filesystem::path GetFilePickerInitialDirectory() const;
+
+  void ClearDialogs();
+
+  Emulator* emulator_;
+  ui::WindowedAppContext& app_context_;
+  EmulatorWindowListener window_listener_;
+
+  std::unique_ptr<ui::Window> window_;
+  std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
+  // Creation may fail, in this case immediate drawer UI must not be drawn.
+  std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
+  ui::Presenter* presenter_painting_ = nullptr;
+
+  bool emulator_initialized_ = false;
+
+  std::string base_title_;
+  bool initializing_shader_storage_ = false;
+  bool compiling_shaders_ = false;
+  std::unique_ptr<wxTimer> compiling_shaders_hide_timer_;
+  // Refreshes the frame rate in the title while a title runs.
+  std::unique_ptr<wxTimer> frame_rate_timer_;
+
+  ui::ImGuiPostProcessingDialog* postprocessing_dialog_ = nullptr;
+  ui::ImGuiPerformanceDialog* performance_dialog_ = nullptr;
+  ui::ImGuiDebugDialog* debug_dialog_ = nullptr;
+  ProfileConfigDialog* profile_dialog_ = nullptr;
+  ui::ImGuiAudioDialog* audio_dialog_ = nullptr;
+  ui::ImGuiMusicDialog* music_dialog_ = nullptr;
+  ui::ImGuiConfirmDialog* stop_title_dialog_ = nullptr;
+  ui::ImGuiContextMenu* context_menu_ = nullptr;
+  // Wheel turns toward the next detent sent to the dashboard.
+  int32_t dash_mouse_wheel_ = 0;
+  std::unordered_set<ui::VirtualKey> hotkeys_down_;
+
+  GameListPanel* game_list_panel_ = nullptr;
+  std::unique_ptr<GameLibrary> game_library_;
+  // Cleared when this window goes, which drops what library threads still have
+  // queued for it.
+  std::shared_ptr<std::atomic<bool>> library_fill_alive_ =
+      std::make_shared<std::atomic<bool>>(true);
+  std::unique_ptr<WxToolbarState> wx_toolbar_state_;
+  // True when the app was started with --target and the title hasn't been
+  // explicitly stopped yet — keeps the render pane visible during the gap
+  // between the window appearing and on_launch firing.
+  bool target_pending_launch_ = false;
+  // Render dimensions captured at app start, restored after Stop.
+  uint32_t default_logical_width_ = 0;
+  uint32_t default_logical_height_ = 0;
+  ui::MenuItem* file_open_menu_item_ = nullptr;
+  ui::MenuItem* file_start_dashboard_menu_item_ = nullptr;
+  ui::MenuItem* file_add_games_menu_item_ = nullptr;
+  ui::MenuItem* file_stop_menu_item_ = nullptr;
+  ui::MenuItem* profile_menu_ = nullptr;
+  ui::MenuItem* controllers_menu_ = nullptr;
+  ui::MenuItem* config_menu_ = nullptr;
+  ui::MenuItem* tools_menu_ = nullptr;
+  ui::MenuItem* audio_menu_ = nullptr;
+  // Dedupes audio-icon bucket updates (no-audio/low/mid/full).
+  int audio_icon_key_ = -1;
+  uint32_t pre_mute_volume_ = 100;
+  ui::MenuItem* view_show_toolbar_item_ = nullptr;
+  bool show_toolbar_ = true;
+  void RefreshProfileMenu();
+  void PopulateProfileMenu(ui::MenuItem* parent);
+  void RefreshControllersMenu();
+  void PopulateControllersMenu(ui::MenuItem* parent);
+  void RefreshControllerToolbar();
+  void ShowControllersPopupMenu();
+  // Native wx prompt for first-run (no profiles); shown before any render
+  // surface.
+  void ShowNoProfilePrompt();
+  void RefreshProfileIcon();
+  // Sync the toolbar's audio icon (bucket) and slider value from cvars::volume.
+  void RefreshAudioIcon();
+  void ToggleMute();
+  void ShowProfilePopupMenu();
+  // Show or hide the icon toolbar pane and persist the preference.
+  void SetToolbarVisible(bool visible);
+  // Show the quick-settings dialog (toolbar settings icon and Configuration >
+  // Main both route here).
+  void ShowQuickSettings();
+  // Reapply the "render visible iff title open or fullscreen, game list
+  // otherwise" invariant. Called on every relevant state change.
+  void ApplyContentVisibility();
+  // Whether xenia may activate its window or move the focus into it on its
+  // own: never while hidden (disable_ui) and unattended only while it already
+  // has the focus, as nobody asked for it.
+  bool MayTakeFocus() const;
+  // Shows the game list, windowed at the default size, after a title stops or
+  // fails to launch.
+  void RestoreListWindow();
+  // Puts the game list back and says why a launch failed.
+  void OnLaunchFailed();
+  // Tear down the running title on a non-guest thread and refresh the UI to
+  // show the game list. Skips the user prompt — caller is responsible for
+  // confirmation. Returns true if the title is being reset in-process, false
+  // if a process swap was scheduled (or no title is open).
+  bool StopTitleAndReturnToList();
+  // StopTitleAndReturnToList, or with DashboardIsHome, starts the dashboard in
+  // place of the title. Returns true when the dashboard is on its way.
+  bool StopTitleAndReturnHome();
+};
+
+}  // namespace app
+}  // namespace xe
+
+#endif  // XENIA_APP_EMULATOR_WINDOW_H_

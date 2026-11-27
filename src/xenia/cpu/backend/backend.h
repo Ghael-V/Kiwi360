@@ -1,0 +1,243 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2013 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+#ifndef XENIA_CPU_BACKEND_BACKEND_H_
+#define XENIA_CPU_BACKEND_BACKEND_H_
+
+#include <atomic>
+#include <memory>
+#include <string>
+
+#include "xenia/cpu/backend/machine_info.h"
+#include "xenia/cpu/thread_debug_info.h"
+
+namespace xe {
+namespace cpu {
+class Breakpoint;
+class Function;
+class GuestFunction;
+class Module;
+class Processor;
+}  // namespace cpu
+}  // namespace xe
+
+namespace xe {
+namespace cpu {
+namespace backend {
+static constexpr uint32_t MAX_GUEST_PSEUDO_STACKTRACE_ENTRIES = 32;
+
+struct GuestPseudoStackTrace {
+  uint32_t count;
+  uint32_t truncated_flag;  // set to 1 if there were more than
+                            // MAX_GUEST_PSEUDO_STACKTRACE_ENTRIES entries.
+  uint32_t return_addrs[MAX_GUEST_PSEUDO_STACKTRACE_ENTRIES];
+};
+class Assembler;
+class CodeCache;
+using GuestTrampolineProc = void (*)(ppc::PPCContext* context, void* userarg1,
+                                     void* userarg2);
+using SimpleGuestTrampolineProc = void (*)(ppc::PPCContext*);
+// One emitted HIR instruction: which sequence the backend selected for it, how
+// much host code that produced, and which guest instruction of the function it
+// belongs to, so the coverage counters can weight it.
+struct SequenceSample {
+  uint64_t key;
+  uint32_t guest_index;
+  uint32_t host_bytes;
+};
+
+class Backend {
+ public:
+  explicit Backend();
+  virtual ~Backend();
+
+  Processor* processor() const { return processor_; }
+  const MachineInfo* machine_info() const { return &machine_info_; }
+  CodeCache* code_cache() const { return code_cache_; }
+
+  virtual std::string name() const { return "unknown"; }
+
+  virtual bool Initialize(Processor* processor);
+
+  virtual void* AllocThreadData();
+  virtual void FreeThreadData(void* thread_data);
+
+  virtual void CommitExecutableRange(uint32_t guest_low,
+                                     uint32_t guest_high) = 0;
+
+  virtual std::unique_ptr<Assembler> CreateAssembler() = 0;
+
+  virtual std::unique_ptr<GuestFunction> CreateGuestFunction(
+      Module* module, uint32_t address) = 0;
+
+  // Calculates the next host instruction based on the current thread state and
+  // current PC. This will look for branches and other control flow
+  // instructions.
+  virtual uint64_t CalculateNextHostInstruction(ThreadDebugInfo* thread_info,
+                                                uint64_t current_pc) = 0;
+
+  virtual void InstallBreakpoint(Breakpoint* breakpoint) {}
+  virtual void InstallBreakpoint(Breakpoint* breakpoint, Function* fn) {}
+  virtual void UninstallBreakpoint(Breakpoint* breakpoint) {}
+  // ctx points to the start of a ppccontext, ctx - page_allocation_granularity
+  // up until the start of ctx may be used by the backend to store whatever data
+  // they want
+  virtual void InitializeBackendContext(void* ctx) {}
+
+  /*
+        Free any dynamically allocated data/resources that the backendcontext
+     uses
+  */
+  virtual void DeinitializeBackendContext(void* ctx) {}
+  virtual void SetGuestRoundingMode(void* ctx, unsigned int mode) {};
+  /*
+        called by KeSetCurrentStackPointers in xboxkrnl_threading.cc just prior
+  to calling XThread::Reenter this is an opportunity for a backend to clear any
+  data related to the guest stack
+
+        in the case of the X64 backend, it means we reset the stackpoint index
+  to 0, since its a new stack and all of our old entries are invalid now
+
+  * */
+  virtual void PrepareForReentry(void* ctx) {}
+
+  // Drops what every guest thread cached about where code in [start, end] was
+  // compiled to, for a guest that has since written other code there. The
+  // thread that wrote the code is rarely the one that runs it.
+  virtual void InvalidateDynamicCalls(uint32_t start, uint32_t end) {}
+
+  // Extra stackpoint records for a guest thread that runs on more than one
+  // host stack, or null from a backend that keeps none. Swapping exchanges the
+  // records in the context with the ones in the state, so swaps have to be
+  // undone in reverse before returning to guest code the other set recorded,
+  // and a state has to be swapped out before it is destroyed.
+  virtual void* CreateStackpointState() { return nullptr; }
+  virtual void DestroyStackpointState(void* state) {}
+  virtual void SwapStackpointState(void* ctx, void* state) {}
+
+  // returns true if populated st
+  virtual bool PopulatePseudoStacktrace(GuestPseudoStackTrace* st) {
+    return false;
+  }
+
+  virtual uint32_t CreateGuestTrampoline(GuestTrampolineProc proc,
+                                         void* userdata1, void* userdata2,
+                                         bool long_term = false) {
+    return 0;
+  }
+  uint32_t CreateGuestTrampoline(void (*func)(ppc::PPCContext*),
+                                 bool long_term = false) {
+    return CreateGuestTrampoline(
+        reinterpret_cast<GuestTrampolineProc>(reinterpret_cast<void*>(func)),
+        nullptr, nullptr);
+  }
+  // if long-term, allocate towards the back of bitset to make allocating short
+  // term ones faster
+  uint32_t CreateLongTermGuestTrampoline(void (*func)(ppc::PPCContext*)) {
+    return CreateGuestTrampoline(
+        reinterpret_cast<GuestTrampolineProc>(reinterpret_cast<void*>(func)),
+        nullptr, nullptr, true);
+  }
+  virtual void FreeGuestTrampoline(uint32_t trampoline_addr) {}
+
+  // lwarx/stwcx. for host code, on the same reservation state the JIT uses, so
+  // a host store cancels a guest thread's reservation. Values are guest endian.
+  // Defaults are a plain access, for backends that never run guest code.
+  virtual uint32_t ReservedLoad32(ppc::PPCContext* context, uint32_t address);
+  virtual uint64_t ReservedLoad64(ppc::PPCContext* context, uint32_t address);
+  virtual bool ReservedStore32(ppc::PPCContext* context, uint32_t address,
+                               uint32_t value);
+  virtual bool ReservedStore64(ppc::PPCContext* context, uint32_t address,
+                               uint64_t value);
+
+  // JIT tracing runtime controls. "available" reflects whether the trace hooks
+  // were compiled into emitted code (XENIA_ENABLE_ITRACE / XENIA_ENABLE_DTRACE
+  // build options); when unavailable the enable flags have no effect.
+  virtual bool trace_instr_available() const { return false; }
+  virtual bool trace_data_available() const { return false; }
+  virtual bool trace_func_available() const { return false; }
+  virtual bool trace_instr_enabled() const { return false; }
+  virtual void set_trace_instr_enabled(bool value) {}
+  virtual bool trace_data_enabled() const { return false; }
+  virtual void set_trace_data_enabled(bool value) {}
+  virtual bool trace_func_enabled() const { return false; }
+  virtual void set_trace_func_enabled(bool value) {}
+
+  // Renders a sequence selection key as "OPCODE_NAME dest src1 src2 src3" for
+  // the profiler dump. The key layout is private to each backend.
+  virtual std::string FormatSequenceKey(uint64_t key) const { return ""; }
+
+ protected:
+  Processor* processor_ = nullptr;
+  MachineInfo machine_info_;
+  CodeCache* code_cache_ = nullptr;
+};
+/*
+ * a set of guest trampolines that all have shared ownership.
+ */
+struct GuestTrampolineGroup
+    : public std::map<SimpleGuestTrampolineProc, uint32_t> {
+  Backend* const m_backend;
+  xe_mutex m_mutex;
+
+  uint32_t _NewTrampoline(SimpleGuestTrampolineProc proc, bool longterm) {
+    std::lock_guard<xe_mutex> lock(m_mutex);
+    auto iter = this->find(proc);
+    if (iter == this->end()) {
+      uint32_t new_entry = longterm
+                               ? m_backend->CreateLongTermGuestTrampoline(proc)
+                               : m_backend->CreateGuestTrampoline(proc);
+      this->emplace_hint(iter, proc, new_entry);
+      return new_entry;
+    }
+    return iter->second;
+  }
+
+ public:
+  GuestTrampolineGroup(Backend* backend) : m_backend(backend) {}
+  ~GuestTrampolineGroup() {
+    std::lock_guard<xe_mutex> lock(m_mutex);
+    for (auto&& entry : *this) {
+      m_backend->FreeGuestTrampoline(entry.second);
+    }
+  }
+
+  uint32_t NewLongtermTrampoline(SimpleGuestTrampolineProc proc) {
+    return _NewTrampoline(proc, true);
+  }
+  uint32_t NewTrampoline(SimpleGuestTrampolineProc proc) {
+    return _NewTrampoline(proc, false);
+  }
+};
+
+uint64_t TrapDebugPrint(void* raw_context);
+
+// Registered by the cooperative scheduler when it starts, null otherwise. A
+// JIT safepoint calls it with the PPCContext once the scheduler has raised the
+// context's preempt_requested flag.
+extern void (*preempt_yield_handler)(void* raw_context);
+
+// Where a stwcx. helper touches guest memory while it holds the granule claim,
+// and the exit that fails it without publishing again.
+struct ReservedStoreFaultSite {
+  uint64_t first_access;
+  uint64_t last_access;
+  uint64_t fail;
+};
+
+// lwarx on a granule a stwcx. has claimed waits a bounded time for the publish,
+// then yields the host thread in case the claimer was preempted. Returns the
+// generation last read, still odd if the claim outlasted the wait.
+uint32_t AwaitReserveGranule(const std::atomic<uint32_t>& granule);
+
+}  // namespace backend
+}  // namespace cpu
+}  // namespace xe
+
+#endif  // XENIA_CPU_BACKEND_BACKEND_H_

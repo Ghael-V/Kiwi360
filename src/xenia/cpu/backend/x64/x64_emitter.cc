@@ -1,0 +1,2687 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+#include "xenia/cpu/backend/x64/x64_emitter.h"
+
+#include <stddef.h>
+
+#include <atomic>
+#include <climits>
+#include <cstring>
+
+#include "third_party/fmt/include/fmt/format.h"
+#include "xenia/base/assert.h"
+#include "xenia/base/atomic.h"
+#include "xenia/base/debugging.h"
+#include "xenia/base/literals.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/math.h"
+#include "xenia/base/memory.h"
+#include "xenia/base/profiling.h"
+#include "xenia/base/vec128.h"
+#include "xenia/cpu/backend/x64/x64_backend.h"
+#include "xenia/cpu/backend/x64/x64_code_cache.h"
+#include "xenia/cpu/backend/x64/x64_function.h"
+#include "xenia/cpu/backend/x64/x64_sequences.h"
+#include "xenia/cpu/backend/x64/x64_stack_layout.h"
+#include "xenia/cpu/backend/x64/x64_tracers.h"
+#include "xenia/cpu/cpu_flags.h"
+#include "xenia/cpu/function.h"
+#include "xenia/cpu/function_debug_info.h"
+#include "xenia/cpu/hir/instr.h"
+#include "xenia/cpu/hir/opcodes.h"
+#include "xenia/cpu/hir/value.h"
+#include "xenia/cpu/processor.h"
+#include "xenia/cpu/symbol.h"
+#include "xenia/cpu/thread_state.h"
+
+DEFINE_bool(ignore_undefined_externs, true,
+            "Don't exit when an undefined extern is called.", "CPU");
+DEFINE_bool(emit_source_annotations, false,
+            "Add extra movs and nops to make disassembly easier to read.",
+            "CPU");
+
+DEFINE_bool(enable_incorrect_roundingmode_behavior, false,
+            "Disables the FPU/VMX MXCSR sharing workaround, potentially "
+            "causing incorrect rounding behavior and denormal handling in VMX "
+            "code. The workaround may cause reduced CPU performance but is a "
+            "more accurate emulation",
+            "x64");
+DEFINE_uint32(align_all_basic_blocks, 0,
+              "Aligns the start of all basic blocks to N bytes. Only specify a "
+              "power of 2, 16 is the recommended value. Results in larger "
+              "icache usage, but potentially faster loops",
+              "x64");
+#if XE_X64_PROFILER_AVAILABLE == 1
+DEFINE_bool(instrument_call_times, false,
+            "Compute time taken for functions, for profiling guest code",
+            "x64");
+#endif
+
+DECLARE_bool(log_safepoint_pc);
+
+namespace xe {
+namespace cpu {
+namespace backend {
+namespace x64 {
+
+using xe::cpu::hir::HIRBuilder;
+using xe::cpu::hir::Instr;
+using namespace xe::literals;
+
+static constexpr size_t kMaxCodeSize = 1_MiB;
+
+// static const size_t kStashOffsetHigh = 32 + 32;
+
+constexpr uint32_t X64Emitter::gpr_reg_map_[X64Emitter::GPR_COUNT] = {
+    Xbyak::Operand::RBX, Xbyak::Operand::R10, Xbyak::Operand::R11,
+    Xbyak::Operand::R12, Xbyak::Operand::R13, Xbyak::Operand::R14,
+    Xbyak::Operand::R15,
+};
+
+constexpr uint32_t X64Emitter::xmm_reg_map_[X64Emitter::XMM_COUNT] = {
+    4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+};
+
+X64Emitter::X64Emitter(X64Backend* backend, XbyakAllocator* allocator)
+    : CodeGenerator(kMaxCodeSize, Xbyak::AutoGrow, allocator),
+      processor_(backend->processor()),
+      backend_(backend),
+      code_cache_(backend->code_cache()),
+      allocator_(allocator) {
+  feature_flags_ = amd64::GetFeatureFlags();
+
+  may_use_membase32_as_zero_reg_ =
+      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+          processor()->memory()->virtual_membase())) == 0;
+}
+
+X64Emitter::~X64Emitter() = default;
+
+bool X64Emitter::Emit(GuestFunction* function, HIRBuilder* builder,
+                      uint32_t debug_info_flags, FunctionDebugInfo* debug_info,
+                      void** out_code_address, size_t* out_code_size,
+                      std::vector<SourceMapEntry>* out_source_map) {
+  SCOPE_profile_cpu_f("cpu");
+  guest_module_ = dynamic_cast<XexModule*>(function->module());
+  current_guest_function_ = function->address();
+  // Reset.
+  debug_info_ = debug_info;
+  debug_info_flags_ = debug_info_flags;
+  coverage_offset_ = function->coverage_offset();
+  coverage_start_address_ = function->address();
+  coverage_instruction_count_ =
+      function->has_end_address()
+          ? (function->end_address() - function->address()) / 4 + 1
+          : 0;
+  coverage_current_index_ = UINT32_MAX;
+  coverage_out_of_range_ = false;
+  sequence_samples_.clear();
+  source_map_arena_.Reset();
+
+  // Fill the generator with code.
+  EmitFunctionInfo func_info = {};
+  if (!Emit(builder, func_info)) {
+    return false;
+  }
+
+  // Copy the final code to the cache and relocate it.
+  *out_code_size = getSize();
+  *out_code_address = Emplace(func_info, function);
+
+  // Stash source map.
+  source_map_arena_.CloneContents(out_source_map);
+
+  if (!sequence_samples_.empty()) {
+    processor_->RecordSequenceSamples(function->address(),
+                                      std::move(sequence_samples_));
+    sequence_samples_.clear();
+  }
+
+  return true;
+}
+void* X64Emitter::Emplace(const EmitFunctionInfo& func_info,
+                          GuestFunction* function) {
+  // To avoid changing xbyak, we do a switcharoo here.
+  // top_ points to the Xbyak buffer, and since we are in AutoGrow mode
+  // it has pending relocations. We copy the top_ to our buffer, swap the
+  // pointer, relocate, then return the original scratch pointer for use.
+  // top_ is used by Xbyak's ready() as both write base pointer and the absolute
+  // address base, which would not work on platforms not supporting writable
+  // executable memory, but Xenia doesn't use absolute label addresses in the
+  // generated code.
+  uint8_t* old_address = top_;
+  void* new_execute_address;
+  void* new_write_address;
+  assert_true(func_info.code_size.total == size_);
+  if (function) {
+    code_cache_->PlaceGuestCode(function->address(), top_, func_info, function,
+                                new_execute_address, new_write_address);
+  } else {
+    code_cache_->PlaceHostCode(0, top_, func_info, new_execute_address,
+                               new_write_address);
+  }
+  top_ = reinterpret_cast<uint8_t*>(new_write_address);
+  ready();
+  top_ = old_address;
+  reset();
+  tail_code_.clear();
+  for (auto&& cached_label : label_cache_) {
+    delete cached_label;
+  }
+  label_cache_.clear();
+  return new_execute_address;
+}
+
+bool X64Emitter::Emit(HIRBuilder* builder, EmitFunctionInfo& func_info) {
+  Xbyak::Label epilog_label;
+  epilog_label_ = &epilog_label;
+  fused_to_single_ = nullptr;
+  function_has_stackpoint_ = false;
+  for (const hir::Block* block = builder->first_block();
+       block && !function_has_stackpoint_; block = block->next) {
+    for (const Instr* i = block->instr_head; i; i = i->next) {
+      if (MakesCall(i)) {
+        function_has_stackpoint_ = true;
+        break;
+      }
+    }
+  }
+
+  // Calculate stack size. We need to align things to their natural sizes.
+  // This could be much better (sort by type/etc).
+  auto locals = builder->locals();
+  size_t stack_offset = StackLayout::GUEST_STACK_SIZE;
+  for (auto it = locals.begin(); it != locals.end(); ++it) {
+    auto slot = *it;
+    size_t type_size = GetTypeSize(slot->type);
+
+    // Align to natural size.
+    stack_offset = xe::align(stack_offset, type_size);
+    slot->set_constant((uint32_t)stack_offset);
+    stack_offset += type_size;
+  }
+
+  // Ensure 16b alignment.
+  stack_offset -= StackLayout::GUEST_STACK_SIZE;
+  stack_offset = xe::align(stack_offset, static_cast<size_t>(16));
+
+  struct _code_offsets {
+    size_t prolog;
+    size_t prolog_stack_alloc;
+    size_t body;
+    size_t epilog;
+    size_t tail;
+  } code_offsets = {};
+
+  code_offsets.prolog = getSize();
+
+  // Function prolog.
+  // Must be 16b aligned.
+  // Windows is very strict about the form of this and the epilog:
+  // https://docs.microsoft.com/en-us/cpp/build/prolog-and-epilog?view=vs-2017
+  // IMPORTANT: any changes to the prolog must be kept in sync with
+  //     X64CodeCache, which dynamically generates exception information.
+  //     Adding or changing anything here must be matched!
+  const size_t stack_size = StackLayout::GUEST_STACK_SIZE + stack_offset;
+  assert_true((stack_size + 8) % 16 == 0);
+  func_info.stack_size = stack_size;
+  stack_size_ = stack_size;
+
+  sub(rsp, (uint32_t)stack_size);
+  code_offsets.prolog_stack_alloc = getSize();
+
+  // After the allocation, so the record is the frame's own stack pointer and
+  // a return into it needs no frame size to adjust by.
+  PushStackpoint();
+
+  code_offsets.body = getSize();
+  xor_(eax, eax);
+  /*
+  * chrispy: removed this, it serves no purpose
+  mov(qword[rsp + StackLayout::GUEST_CTX_HOME], GetContextReg());
+  */
+
+  mov(qword[rsp + StackLayout::GUEST_RET_ADDR], rcx);
+
+  mov(qword[rsp + StackLayout::GUEST_CALL_RET_ADDR], rax);  // 0
+
+#if XE_X64_PROFILER_AVAILABLE == 1
+  if (cvars::instrument_call_times) {
+    mov(rdx, 0x7ffe0014);  // load pointer to kusershared systemtime
+    mov(rdx, qword[rdx]);
+    mov(qword[rsp + StackLayout::GUEST_PROFILER_START],
+        rdx);  // save time for end of function
+  }
+#endif
+  // FTrace: log guest function entry when the backend was built with
+  // function tracing available (gated at runtime by the trace_func flag).
+  if (IsTracingFunc()) {
+    mov(GetNativeParam(0), current_guest_function_);
+    CallNative(reinterpret_cast<void*>(TraceFunctionEntry));
+  }
+
+  // Load membase.
+  /*
+  * chrispy: removed this, as long as we load it in HostToGuestThunk we can
+  count on no other code modifying it. mov(GetMembaseReg(),
+      qword[GetContextReg() + offsetof(ppc::PPCContext, virtual_membase)]);
+  */
+  // Body.
+  auto block = builder->first_block();
+  synchronize_stack_on_next_instruction_ = false;
+  while (block) {
+    ForgetMxcsrMode();  // at start of block, mxcsr mode is undefined
+
+    // Mark block labels.
+    auto label = block->label_head;
+    while (label) {
+      L(std::to_string(label->id));
+      label = label->next;
+    }
+
+    if (cvars::align_all_basic_blocks) {
+      align(cvars::align_all_basic_blocks, true);
+    }
+    // Process instructions.
+    const Instr* instr = block->instr_head;
+    while (instr) {
+      if (synchronize_stack_on_next_instruction_) {
+        // The check has to land after MarkSourceOffset has stamped the
+        // guest->host mapping, or a longjmp lands past it and never runs it.
+        // With debug info on, a COMMENT precedes the SOURCE_OFFSET, so both
+        // have to be skipped, not just the source offset.
+        const hir::Opcode opcode_num = instr->GetOpcodeNum();
+        if (opcode_num != hir::OPCODE_SOURCE_OFFSET &&
+            opcode_num != hir::OPCODE_COMMENT) {
+          synchronize_stack_on_next_instruction_ = false;
+          EnsureSynchronizedGuestAndHostStack();
+        }
+      }
+      const Instr* new_tail = instr;
+      if (!SelectSequence(this, instr, &new_tail)) {
+        // No sequence found!
+        // NOTE: If you encounter this after adding a new instruction, do a full
+        // rebuild!
+        assert_always();
+        XELOGE("Unable to process HIR opcode {}", GetOpcodeName(instr->opcode));
+        break;
+      }
+      instr = new_tail;
+    }
+
+    block = block->next;
+  }
+
+  // Function epilog.
+  L(epilog_label);
+  epilog_label_ = nullptr;
+  // A call as the last instruction leaves the check unconsumed.
+  if (synchronize_stack_on_next_instruction_) {
+    synchronize_stack_on_next_instruction_ = false;
+    EnsureSynchronizedGuestAndHostStack();
+  }
+  // FTrace: log the guest return value (r3) on normal return.
+  if (IsTracingFunc()) {
+    mov(GetNativeParam(0), current_guest_function_);
+    CallNative(reinterpret_cast<void*>(TraceFunctionReturn));
+  }
+  EmitTraceUserCallReturn();
+  /*
+  * chrispy: removed this, it serves no purpose
+  mov(GetContextReg(), qword[rsp + StackLayout::GUEST_CTX_HOME]);
+  */
+  code_offsets.epilog = getSize();
+  EmitProfilerEpilogue();
+
+  add(rsp, (uint32_t)stack_size);
+  PopStackpoint();
+  ret();
+  // todo: do some kind of sorting by alignment?
+  // By index, so tails that a tail's callback adds are emitted too
+  for (size_t i = 0; i < tail_code_.size(); i++) {
+    TailEmitter& tail_item = tail_code_[i];
+    if (tail_item.alignment) {
+      align(tail_item.alignment);
+    }
+    tail_item.func(*this, tail_item.label);
+  }
+
+  code_offsets.tail = getSize();
+
+  if (cvars::emit_source_annotations) {
+    nop(5);
+  }
+
+  assert_zero(code_offsets.prolog);
+  func_info.code_size.total = getSize();
+  func_info.code_size.prolog = code_offsets.body - code_offsets.prolog;
+  func_info.code_size.body = code_offsets.epilog - code_offsets.body;
+  func_info.code_size.epilog = code_offsets.tail - code_offsets.epilog;
+  func_info.code_size.tail = getSize() - code_offsets.tail;
+  func_info.prolog_stack_alloc_offset =
+      code_offsets.prolog_stack_alloc - code_offsets.prolog;
+
+  return true;
+}
+// dont use rax, we do this in tail call handling
+void X64Emitter::EmitProfilerEpilogue() {
+#if XE_X64_PROFILER_AVAILABLE == 1
+  if (cvars::instrument_call_times) {
+    uint64_t* profiler_entry =
+        backend()->GetProfilerRecordForFunction(current_guest_function_);
+
+    mov(ecx, 0x7ffe0014);
+    mov(rdx, qword[rcx]);
+    mov(r10, (uintptr_t)profiler_entry);
+    sub(rdx, qword[rsp + StackLayout::GUEST_PROFILER_START]);
+
+    // atomic add our time to the profiler entry
+    // this could be atomic free if we had per thread profile counts, and on a
+    // threads exit we lock and sum up to the global counts, which would make
+    // this a few cycles less intrusive, but its good enough for now
+    //  actually... lets just try without atomics lol
+    // lock();
+    add(qword[r10], rdx);
+  }
+#endif
+}
+
+void X64Emitter::MarkSourceOffset(const Instr* i) {
+  auto entry = source_map_arena_.Alloc<SourceMapEntry>();
+  entry->guest_address = static_cast<uint32_t>(i->src1.offset);
+  entry->hir_offset = uint32_t(i->block->ordinal << 16) | i->ordinal;
+  entry->code_offset = static_cast<uint32_t>(getSize());
+
+  if (cvars::emit_source_annotations) {
+    nop(2);
+    mov(eax, entry->guest_address);
+    nop(2);
+  }
+
+  if ((debug_info_flags_ & DebugInfoFlags::kDebugInfoTraceFunctionCoverage) &&
+      coverage_offset_ != GuestFunction::kInvalidCoverageOffset) {
+    // A source offset is not guaranteed to land inside the range the scanner
+    // reported, and counting outside the reserved slice writes through a wild
+    // displacement into whatever the arena holds next.
+    uint32_t instruction_index =
+        (entry->guest_address - coverage_start_address_) / 4;
+    if (entry->guest_address < coverage_start_address_ ||
+        instruction_index >= coverage_instruction_count_) {
+      coverage_current_index_ = UINT32_MAX;
+      if (!coverage_out_of_range_) {
+        coverage_out_of_range_ = true;
+        XELOGW(
+            "Coverage: {:08X} is outside {:08X} and the {} instructions after "
+            "it, not counting it",
+            entry->guest_address, coverage_start_address_,
+            coverage_instruction_count_);
+      }
+      return;
+    }
+    // Everything emitted from here until the next source offset belongs to
+    // this guest instruction.
+    coverage_current_index_ = instruction_index;
+    size_t byte_offset = coverage_offset_ + size_t(instruction_index) * 8;
+    uint32_t disp = static_cast<uint32_t>(byte_offset);
+    // Counters are per thread, so this needs no lock. rax and rcx are outside
+    // gpr_reg_map_ and this sits on its own OPCODE_SOURCE_OFFSET instruction,
+    // so no HIR value is live in either.
+    //
+    // Incremented through lea because EFLAGS has to survive: a guest compare
+    // and the branch consuming it are separate guest instructions, so a source
+    // offset lands between them and inc would eat the result.
+    mov(rax, qword[GetContextReg() + offsetof(ppc::PPCContext, trace_counts)]);
+    mov(rcx, qword[rax + disp]);
+    lea(rcx, ptr[rcx + 1]);
+    mov(qword[rax + disp], rcx);
+  }
+}
+
+void X64Emitter::RecordSequenceSample(const hir::Instr* i, uint32_t backend_key,
+                                      uint32_t host_bytes) {
+  if (coverage_current_index_ == UINT32_MAX || !host_bytes) {
+    return;
+  }
+  sequence_samples_.push_back({hir::MakeSequenceSampleKey(i, backend_key),
+                               coverage_current_index_, host_bytes});
+}
+
+void X64Emitter::EmitTraceUserCallReturn() {}
+
+void X64Emitter::DebugBreak() {
+  // TODO(benvanik): notify debugger.
+  db(0xCC);
+}
+
+uint64_t TrapDebugPrint(void* raw_context, uint64_t address) {
+  return backend::TrapDebugPrint(raw_context);
+}
+
+uint64_t TrapDebugBreak(void* raw_context, uint64_t address) {
+  auto thread_state =
+      reinterpret_cast<ppc::PPCContext_s*>(raw_context)->thread_state;
+  XELOGE("tw/td forced trap hit! This should be a crash!");
+  if (cvars::break_on_debugbreak) {
+    xe::debugging::Break();
+  }
+  return 0;
+}
+
+void X64Emitter::Trap(uint16_t trap_type) {
+  switch (trap_type) {
+    case 20:
+    case 26:
+      // 0x0FE00014 is a 'debug print' where r3 = buffer r4 = length
+      CallNative(TrapDebugPrint, 0);
+      break;
+    case 0:
+    case 22:
+      // Always trap?
+      // TODO(benvanik): post software interrupt to debugger.
+      CallNative(TrapDebugBreak, 0);
+      break;
+    case 25:
+      // ?
+      break;
+    default:
+      XELOGW("Unknown trap type {}", trap_type);
+      db(0xCC);
+      break;
+  }
+}
+
+void X64Emitter::UnimplementedInstr(const hir::Instr* i) {
+  // TODO(benvanik): notify debugger.
+  db(0xCC);
+  assert_always();
+}
+
+// The function a live frame runs. The frame is in a call, which pushed an
+// address in its own code just below it.
+static X64Function* LookupFrameFunction(
+    X64Backend* backend, const X64BackendStackpoint& stackpoint) {
+  return static_cast<X64Function*>(
+      backend->code_cache()->LookupFunction(*reinterpret_cast<const uint64_t*>(
+          stackpoint.host_stack_ - sizeof(uint64_t))));
+}
+
+// Where a return site in an already translated function continues, when the
+// guest is unwinding to it past more than one frame, or 0. The caller
+// decides that |target_address| is a return site. |pending_pops| is
+// how many stackpoints the branch still pops after resolving, which the stack
+// synchronization helper will not see.
+static uint64_t ResolveLongjmp(ppc::PPCContext_s* guest_context,
+                               uint32_t target_address, uint32_t pending_pops) {
+  /*
+         The purpose of this code is to allow guest longjmp to call into
+     the body of an existing host function. There are a lot of conditions we
+     have to check here to ensure that we do not mess up a normal call to a
+     function
+
+         The target address must be a known return site. The guest address
+     must be part of a function that was already translated.
+
+  */
+  auto processor = guest_context->thread_state->processor();
+  X64Backend* backend = static_cast<X64Backend*>(processor->backend());
+  // grab the backend context, next we have to check whether the
+  // guest and host stack are out of sync if they arent, its fine
+  // for the backend to create a new function for the guest
+  // address we're resolving if they are, it means that the reason
+  // we're resolving this address is because context is being
+  // restored (probably by longjmp)
+  X64BackendContext* backend_context =
+      backend->BackendContextForGuestContext(guest_context);
+
+  if (backend_context->current_stackpoint_depth <= pending_pops) {
+    return 0;
+  }
+  uint32_t current_stackpoint_index =
+      backend_context->current_stackpoint_depth - pending_pops;
+
+  --current_stackpoint_index;
+
+  X64BackendStackpoint* stackpoints = backend_context->stackpoints;
+
+  uint32_t current_guest_stackpointer =
+      static_cast<uint32_t>(guest_context->r[1]);
+  uint32_t num_frames_bigger = 0;
+
+  /*
+          if the current guest stack pointer is bigger than the
+     recorded pointer for this stack thats fine, plenty of
+     functions restore the original stack pointer early
+
+          if more than 1... we're longjmping and sure of it at
+     this point (jumping to a return site that has already been
+     emitted)
+  */
+  while (current_stackpoint_index != 0xFFFFFFFF) {
+    if (current_guest_stackpointer >
+        stackpoints[current_stackpoint_index].guest_stack_) {
+      --current_stackpoint_index;
+      ++num_frames_bigger;
+
+    } else {
+      break;
+    }
+  }
+  /*
+                          DEFINITELY a longjmp, return original
+     host address. returning the existing host address is going to
+     set off some extra machinery we have set up to support this
+
+                          to break it down, the resolve that
+     reaches here starts at
+     X64Backend::resolve_function_thunk_ which is implemented in
+     x64_backend.cc X64HelperEmitter::EmitResolveFunctionThunk, or
+     a call from the resolver table
+
+                          the x64 fastcall abi dictates that the
+     stack must always be 16 byte aligned. We select our stack
+     size for functions to ensure that we keep rsp aligned to 16
+     bytes
+
+                          but by calling into the body of an
+     existing function we've pushed our return address onto the
+     stack (dont worry about this return address, it gets
+     discarded in a later step)
+
+                          this means that the stack is no longer
+     16 byte aligned, (rsp % 16) now == 8, and this is the only
+     time outside of the prolog or epilog of a function that this
+     will be the case
+
+                          so, after all direct or indirect
+     function calls we set
+     X64Emitter::synchronize_stack_on_next_instruction_ to true.
+                          On the next instruction that is not
+     OPCODE_SOURCE_OFFSET we will emit a check when we see
+     synchronize_stack_on_next_instruction_ is true. We have to
+     skip OPCODE_SOURCE_OFFSET because its not a "real"
+     instruction and if we emit on it the return address of the
+     function call will point to AFTER our check, so itll never be
+     executed.
+
+                          our check is just going to do test esp,
+     15 to see if the stack is misaligned. (using esp instead of
+     rsp saves 1 byte). We tail emit the handling for when the
+     check succeeds because in 99.99999% of function calls it will
+     be aligned, in the end the runtime cost of these checks is 5
+     bytes for the test instruction which ought to be one cycle
+     and 5 bytes for the jmp with no cycles taken for the jump
+     which will be predicted not taken.
+
+    Our handling for the check is implemented in
+    X64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper, which
+    we call directly.
+
+                    The helper takes the frame recorded in
+    unwind_stackpoint_depth and sets the current host rsp to the
+    host stack pointer value in its entry, which is that frame's
+    own stack pointer because the record is taken after the frame
+    is allocated. the current stackpoint index is adjusted to
+    point to the one after the stackpoint we restored to.
+
+                    The helper then jumps back to the function
+    that was longjmp'ed to, with the host stack in its proper
+    state. it just works!
+
+
+
+   */
+
+  // With every recorded frame below r1 the helper has no frame to restore.
+  if (num_frames_bigger <= 1 || current_stackpoint_index == 0xFFFFFFFF) {
+    return 0;
+  }
+  // The target's code only fits the frame of the function it was translated
+  // in. r1 alone can name the wrong frame: a callee entered at the stack
+  // pointer longjmp restores records the same r1 as its caller runs at, and
+  // XeFu's generated code keeps the x86 stack pointer in r1.
+  for (uint32_t i = current_stackpoint_index + 1; i-- > 0;) {
+    // The frame longjmp returns to made a call, so it runs below the stack
+    // pointer it was entered with.
+    if (stackpoints[i].guest_stack_ <= current_guest_stackpointer) {
+      continue;
+    }
+    X64Function* function = LookupFrameFunction(backend, stackpoints[i]);
+    // Landing on a function's first instruction would skip its prolog.
+    if (!function || function->address() == target_address) {
+      continue;
+    }
+    // A function's range can hold unreachable instructions it has no code for.
+    if (uintptr_t host_address =
+            function->MapGuestAddressToMachineCode(target_address)) {
+      // The stack synchronization helper at the target restores this frame.
+      backend_context->unwind_stackpoint_depth = i + 1;
+      /*
+       * can't do anything about this right now :(
+       * epic mickey is quite slow due to having to call resolve on
+       * every longjmp, and it longjmps a lot but if we add an
+       * indirection we lose our stack misalignment check
+       */
+      return host_address;
+    }
+  }
+  return 0;
+}
+
+// This is used by the X64ThunkEmitter's ResolveFunctionThunk.
+uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
+  auto guest_context = reinterpret_cast<ppc::PPCContext_s*>(raw_context);
+
+  auto thread_state = guest_context->thread_state;
+
+  // TODO(benvanik): required?
+  assert_not_zero(target_address);
+
+  if (cvars::enable_host_guest_stack_synchronization) {
+    // Only a XexModule carries instruction flags, so only its return sites
+    // are recognized.
+    auto xexmod =
+        dynamic_cast<XexModule*>(thread_state->processor()->LookupModule(
+            static_cast<uint32_t>(target_address)));
+    InfoCacheFlags* flags = xexmod ? xexmod->GetInstructionAddressFlags(
+                                         static_cast<uint32_t>(target_address))
+                                   : nullptr;
+    if (flags && flags->is_return_site) {
+      if (uint64_t host_address = ResolveLongjmp(
+              guest_context, static_cast<uint32_t>(target_address), 0)) {
+        return host_address;
+      }
+    }
+  }
+
+  uint32_t address = static_cast<uint32_t>(target_address);
+  auto fn =
+      thread_state->processor()->ResolveCallTarget(guest_context, &address);
+  if (!fn) {
+    XELOGE("No guest code at {:08X} for a call", address);
+    return 0;
+  }
+  auto x64_fn = static_cast<X64Function*>(fn);
+  uint64_t addr = reinterpret_cast<uint64_t>(x64_fn->machine_code());
+
+  return addr;
+}
+
+// The host address in a live frame that a dynamic code branch to the
+// instruction after its call returns to, or 0. The branch returns there however
+// many frames it skips or bytes the callee popped. The stack synchronization
+// helper at the target restores the calling frame recorded here.
+// |pending_pops| is how many stackpoints the branch still pops after resolving.
+static uint64_t FindLiveReturn(ppc::PPCContext_s* guest_context,
+                               uint32_t target_address, uint32_t pending_pops) {
+  auto backend = static_cast<X64Backend*>(guest_context->processor->backend());
+  X64BackendContext* backend_context =
+      backend->BackendContextForGuestContext(guest_context);
+  const uint32_t depth = backend_context->current_stackpoint_depth;
+  const uint32_t live_frames = depth > pending_pops ? depth - pending_pops : 0;
+  const uint32_t stack_pointer = static_cast<uint32_t>(guest_context->r[1]);
+  // A live frame matches only once the guest stack is back at or above its call
+  // point, which a nested call never reaches. The difference is what the callee
+  // popped from the caller's own frame, so the smallest one is the frame
+  // returned to, which a recursive caller can have several of.
+  uint32_t found_index = 0;
+  uint32_t found_popped = UINT32_MAX;
+  uint64_t found_host_address = 0;
+  // Index 0 was entered from host code, which has no frame to return into.
+  for (uint32_t i = live_frames; i-- > 1;) {
+    const X64BackendStackpoint& stackpoint = backend_context->stackpoints[i];
+    if (stackpoint.guest_return_address_ != target_address ||
+        stackpoint.guest_stack_ > stack_pointer ||
+        stack_pointer - stackpoint.guest_stack_ >= found_popped) {
+      continue;
+    }
+    // The call that entered the frame pushed its return address just below the
+    // calling frame's own stack pointer.
+    const uint64_t host_return = *reinterpret_cast<const uint64_t*>(
+        backend_context->stackpoints[i - 1].host_stack_ - sizeof(uint64_t));
+    auto function = backend->code_cache()->LookupFunction(host_return);
+    if (!function ||
+        function->MapGuestAddressToMachineCode(target_address) != host_return) {
+      continue;
+    }
+    found_index = i;
+    found_popped = stack_pointer - stackpoint.guest_stack_;
+    found_host_address = host_return;
+    if (!found_popped) {
+      break;
+    }
+  }
+  if (found_host_address) {
+    // The helper restores stackpoints[depth - 1], so this names the calling
+    // frame, whose record is the host stack it called with.
+    backend_context->unwind_stackpoint_depth = found_index;
+  }
+  return found_host_address;
+}
+
+// The guest return address host code enters guest code with.
+constexpr uint32_t kHostReturnAddress = 0xBCBCBCBC;
+
+// Where a dynamic code branch to kHostReturnAddress continues, or 0. Guest code
+// can divert its return and branch to the saved address from deeper frames, as
+// XeFu's trap handler does, so the branch returns to host code from the
+// innermost frame host code entered. That can be the frame a tail branch is
+// about to pop, which returning pops anyway.
+static uint64_t ResolveHostReturn(ppc::PPCContext_s* guest_context) {
+  auto backend = static_cast<X64Backend*>(guest_context->processor->backend());
+  X64BackendContext* backend_context =
+      backend->BackendContextForGuestContext(guest_context);
+  for (uint32_t i = backend_context->current_stackpoint_depth; i-- > 0;) {
+    const uint64_t frame = backend_context->stackpoints[i].host_stack_;
+    // A tail call passes the address on to the function taking the frame.
+    if (*reinterpret_cast<const uint32_t*>(
+            frame + StackLayout::GUEST_RET_ADDR) != kHostReturnAddress) {
+      continue;
+    }
+    X64Function* function =
+        LookupFrameFunction(backend, backend_context->stackpoints[i]);
+    if (!function) {
+      return 0;
+    }
+    backend_context->host_return_stack = frame + function->stack_size();
+    backend_context->unwind_stackpoint_depth = i;
+    return reinterpret_cast<uint64_t>(backend->return_to_host_helper());
+  }
+  return 0;
+}
+
+// Where a dynamic code branch to the instruction after a call continues in
+// translated code, or 0. While the frame of that call is live, the branch
+// returns into it. Once the call has returned, as for setjmp, the guest stack
+// decides how far to unwind. |pending_pops| is as for FindLiveReturn and
+// |out_is_return_site| tells the caller whether the target follows a call.
+static uint64_t ResolveDynamicReturn(ppc::PPCContext_s* guest_context,
+                                     uint32_t target_address,
+                                     uint32_t pending_pops,
+                                     bool* out_is_return_site) {
+  *out_is_return_site = false;
+  if (!cvars::enable_host_guest_stack_synchronization) {
+    return 0;
+  }
+  if (target_address == kHostReturnAddress) {
+    return ResolveHostReturn(guest_context);
+  }
+  if (uint64_t host_address =
+          FindLiveReturn(guest_context, target_address, pending_pops)) {
+    // Matching a recorded return address proves the target follows a call.
+    *out_is_return_site = true;
+    return host_address;
+  }
+  auto processor = guest_context->processor;
+
+  // Dynamic code has no instruction flags, so recognize the call before it.
+  if (target_address < 4) {
+    return 0;
+  }
+  auto module = processor->LookupModule(target_address - 4);
+  if (!module) {
+    return 0;
+  }
+  const uint32_t previous =
+      xe::load_and_swap<uint32_t>(module->TranslateCode(target_address - 4));
+  const bool is_return_site = ((previous & 0xFC000001) == 0x48000001) ||
+                              ((previous & 0xFC000001) == 0x40000001) ||
+                              ((previous & 0xFC0007FF) == 0x4C000421) ||
+                              ((previous & 0xFC0007FF) == 0x4C000021);
+  *out_is_return_site = is_return_site;
+  if (!is_return_site) {
+    return 0;
+  }
+  return ResolveLongjmp(guest_context, target_address, pending_pops);
+}
+
+// Resolves a target without an indirection slot and caches it per thread. A
+// direct bl is never a return and skips the return site checks.
+static uint64_t ResolveDynamicFunction(void* raw_context,
+                                       uint64_t target_address,
+                                       uint32_t pending_pops,
+                                       bool direct = false) {
+  auto guest_context = reinterpret_cast<ppc::PPCContext_s*>(raw_context);
+  bool is_return_site = false;
+  if (!direct) {
+    if (uint64_t return_address = ResolveDynamicReturn(
+            guest_context, static_cast<uint32_t>(target_address), pending_pops,
+            &is_return_site)) {
+      static_cast<X64Backend*>(guest_context->processor->backend())
+          ->BackendContextForGuestContext(raw_context)
+          ->dynamic_target_in_body = 1;
+      return return_address;
+    }
+  }
+  const uint64_t sweep_count = guest_context->processor->code_sweep_count();
+  uint32_t address = static_cast<uint32_t>(target_address);
+  auto function =
+      guest_context->processor->ResolveCallTarget(guest_context, &address);
+  if (!function) {
+    XELOGE("No guest code at {:08X} for a dynamic call", address);
+    return 0;
+  }
+  const uint64_t host_address = reinterpret_cast<uint64_t>(
+      static_cast<X64Function*>(function)->machine_code());
+  // A redirect isn't cached, since the checks above were for the original
+  // target.
+  if (address != static_cast<uint32_t>(target_address)) {
+    return host_address;
+  }
+  auto backend = static_cast<X64Backend*>(guest_context->processor->backend());
+  auto bctx = backend->BackendContextForGuestContext(raw_context);
+  if (!bctx->dynamic_call_cache) {
+    bctx->dynamic_call_cache =
+        new X64DynamicCallCacheEntry[kX64DynamicCallCacheSize];
+    for (uint32_t i = 0; i < kX64DynamicCallCacheSize; ++i) {
+      bctx->dynamic_call_cache[i] = {UINT32_MAX, 0, 0};
+    }
+  }
+  // An unwind lands at an address only valid for the frame it found and is
+  // never cached. A return site's entry has a branch look for a live frame
+  // first.
+  auto& entry = bctx->dynamic_call_cache[X64DynamicCallCacheIndex(
+      static_cast<uint32_t>(target_address))];
+  entry.host_address = host_address;
+  entry.kind = direct           ? kX64DynamicCallDirectOnly
+               : is_return_site ? kX64DynamicCallReturnSite
+                                : kX64DynamicCallAny;
+  entry.guest_address = static_cast<uint32_t>(target_address);
+  // A sweep since the resolve began may have dropped the function before the
+  // entry was there for it to clear. The fence pairs with the sweep's count
+  // bump before it clears entries.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  if (guest_context->processor->code_sweep_count() != sweep_count) {
+    entry.host_address = 0;
+    entry.guest_address = UINT32_MAX;
+  }
+  return host_address;
+}
+
+static uint64_t ResolveDynamicCall(void* raw_context, uint64_t target_address) {
+  return ResolveDynamicFunction(raw_context, target_address, 0);
+}
+
+static uint64_t ResolveDirectDynamicCall(void* raw_context,
+                                         uint64_t target_address) {
+  return ResolveDynamicFunction(raw_context, target_address, 0, true);
+}
+
+// A tail branch pops the current function's stackpoint after resolving.
+static uint64_t ResolveDynamicTailCall(void* raw_context,
+                                       uint64_t target_address) {
+  return ResolveDynamicFunction(raw_context, target_address, 1);
+}
+
+// Whether ResolveLongjmp could land a branch inside a function body, which
+// takes the top two live frames being below r1.
+static bool MayResolveLongjmp(ppc::PPCContext_s* guest_context,
+                              uint32_t pending_pops) {
+  auto bctx = static_cast<X64Backend*>(guest_context->processor->backend())
+                  ->BackendContextForGuestContext(guest_context);
+  const uint32_t depth = bctx->current_stackpoint_depth;
+  if (depth < pending_pops + 3) {
+    return false;
+  }
+  const uint32_t top = depth - pending_pops - 1;
+  const uint32_t stack_pointer = static_cast<uint32_t>(guest_context->r[1]);
+  return stack_pointer > bctx->stackpoints[top].guest_stack_ &&
+         stack_pointer > bctx->stackpoints[top - 1].guest_stack_;
+}
+
+// A branch to a return site with a cached function takes the function unless
+// a live frame returns there or a longjmp could land in a body, which the full
+// resolve handles.
+static uint64_t ResolveCachedReturnSite(void* raw_context,
+                                        uint64_t target_address,
+                                        uint32_t pending_pops) {
+  auto guest_context = reinterpret_cast<ppc::PPCContext_s*>(raw_context);
+  auto bctx = static_cast<X64Backend*>(guest_context->processor->backend())
+                  ->BackendContextForGuestContext(raw_context);
+  const uint32_t target = static_cast<uint32_t>(target_address);
+  if (uint64_t host_address =
+          FindLiveReturn(guest_context, target, pending_pops)) {
+    bctx->dynamic_target_in_body = 1;
+    return host_address;
+  }
+  // Read once, as another thread can invalidate the entry meanwhile.
+  const auto& entry =
+      bctx->dynamic_call_cache[X64DynamicCallCacheIndex(target)];
+  const uint64_t cached_address = entry.host_address;
+  if (MayResolveLongjmp(guest_context, pending_pops) ||
+      entry.guest_address != target ||
+      entry.kind != kX64DynamicCallReturnSite || !cached_address) {
+    return ResolveDynamicFunction(raw_context, target_address, pending_pops);
+  }
+  return cached_address;
+}
+
+static uint64_t ResolveCachedReturnSiteCall(void* raw_context,
+                                            uint64_t target_address) {
+  return ResolveCachedReturnSite(raw_context, target_address, 0);
+}
+
+static uint64_t ResolveCachedReturnSiteTail(void* raw_context,
+                                            uint64_t target_address) {
+  return ResolveCachedReturnSite(raw_context, target_address, 1);
+}
+
+// Loads the host address for the guest address in edx into rax. A direct bl,
+// |direct| without |tail|, takes any entry. Other lookups take Any entries and
+// check a return site's for a live frame.
+static void EmitDynamicCallLookup(X64Emitter& e, bool tail,
+                                  bool direct = false) {
+  const bool direct_call = direct && !tail;
+  Xbyak::Label miss;
+  Xbyak::Label done;
+  Xbyak::Label check_kind;
+  e.mov(e.eax, e.edx);
+  e.shr(e.eax, 2);
+  e.mov(e.ecx, e.edx);
+  e.shr(e.ecx, 14);
+  e.xor_(e.eax, e.ecx);
+  e.and_(e.eax, kX64DynamicCallCacheSize - 1);
+  e.shl(e.eax, 4);
+  e.mov(e.rcx,
+        e.GetBackendCtxPtr(offsetof(X64BackendContext, dynamic_call_cache)));
+  e.test(e.rcx, e.rcx);
+  e.jz(miss, X64Emitter::T_NEAR);
+  e.cmp(e.dword[e.rcx + e.rax], e.edx);
+  e.jne(miss, X64Emitter::T_NEAR);
+  if (!direct_call) {
+    static_assert(offsetof(X64DynamicCallCacheEntry, kind) == 4);
+    e.cmp(e.dword[e.rcx + e.rax + 4], uint32_t(kX64DynamicCallAny));
+    e.jne(check_kind, X64Emitter::T_NEAR);
+  }
+  e.mov(e.rax, e.qword[e.rcx + e.rax + 8]);
+  // An entry the cache was initialized with holds no address.
+  e.test(e.rax, e.rax);
+  e.jz(miss, X64Emitter::T_NEAR);
+  e.jmp(done, X64Emitter::T_NEAR);
+  if (!direct_call) {
+    e.L(check_kind);
+    e.cmp(e.dword[e.rcx + e.rax + 4], uint32_t(kX64DynamicCallReturnSite));
+    e.jne(miss, X64Emitter::T_NEAR);
+    e.CallNativeSafe(reinterpret_cast<void*>(
+        tail ? ResolveCachedReturnSiteTail : ResolveCachedReturnSiteCall));
+    e.jmp(done, X64Emitter::T_NEAR);
+  }
+  e.L(miss);
+  e.CallNativeSafe(reinterpret_cast<void*>(direct_call
+                                               ? ResolveDirectDynamicCall
+                                           : tail ? ResolveDynamicTailCall
+                                                  : ResolveDynamicCall));
+  e.L(done);
+}
+
+bool X64Emitter::InlinesPPCGprLrSaveRestore(
+    const hir::Instr* instr, const GuestFunction* function) const {
+  if (!function->IsSaverest() ||
+      function->SaverestType() != SaveRestoreType::GPR) {
+    return false;
+  }
+  const unsigned first_gpr = function->SaverestIndex();
+  if (first_gpr < 14 || first_gpr > 31) {
+    return false;
+  }
+  const bool is_tail_call = (instr->flags & hir::CALL_TAIL) != 0;
+  return !((function->IsSave() && is_tail_call) ||
+           (function->IsRestore() && !is_tail_call));
+}
+
+bool X64Emitter::MakesCall(const hir::Instr* instr) const {
+  switch (instr->opcode->num) {
+    case hir::OPCODE_CALL:
+      return !InlinesPPCGprLrSaveRestore(
+          instr, static_cast<const GuestFunction*>(instr->src1.symbol));
+    case hir::OPCODE_CALL_TRUE:
+      return !InlinesPPCGprLrSaveRestore(
+          instr, static_cast<const GuestFunction*>(instr->src2.symbol));
+    case hir::OPCODE_CALL_INDIRECT:
+    case hir::OPCODE_CALL_INDIRECT_TRUE:
+    // Host code can run guest code, which unwinds into this frame.
+    case hir::OPCODE_CALL_EXTERN:
+    case hir::OPCODE_TRAP:
+    case hir::OPCODE_TRAP_TRUE:
+    case hir::OPCODE_DEBUG_BREAK:
+    case hir::OPCODE_DEBUG_BREAK_TRUE:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool X64Emitter::TryInlinePPCGprLrSaveRestore(const hir::Instr* instr,
+                                              const GuestFunction* function) {
+  if (!InlinesPPCGprLrSaveRestore(instr, function)) {
+    return false;
+  }
+
+  const unsigned first_gpr = function->SaverestIndex();
+
+  // Standard PPC helper layout:
+  //   std/ld rN, -((33 - N) * 8)(r1), N = first_gpr..31
+  //   stw/lwz r12, -8(r1)
+  const int32_t first_slot_offset = static_cast<int32_t>((33 - first_gpr) * 8);
+  const int32_t lr_slot_offset = -8;
+
+  // rax = guest r1. Scratch here must stay out of gpr_reg_map_ (RBX, R10-R15)
+  // so live HIR values survive; rax/rcx/rdx are free at a call site.
+  mov(eax, dword[GetContextReg() + offsetof(ppc::PPCContext, r[1])]);
+  if (xe::memory::allocation_granularity() > 0x1000) {
+    // Branch-free: edx = r1 + 0x1000, kept only when r1 >= 0xE0000000.
+    lea(edx, ptr[rax + 0x1000]);
+    cmp(eax, 0xE0000000);
+    cmovae(eax, edx);
+  }
+
+  const bool has_movbe = IsFeatureEnabled(kX64EmitMovbe);
+
+  if (function->IsSave()) {
+    for (unsigned guest_reg = first_gpr; guest_reg <= 31; ++guest_reg) {
+      const int32_t disp = -first_slot_offset +
+                           static_cast<int32_t>((guest_reg - first_gpr) * 8);
+      mov(rdx,
+          qword[GetContextReg() + offsetof(ppc::PPCContext, r[guest_reg])]);
+      if (has_movbe) {
+        movbe(qword[GetMembaseReg() + rax + disp], rdx);
+      } else {
+        bswap(rdx);
+        mov(qword[GetMembaseReg() + rax + disp], rdx);
+      }
+    }
+
+    mov(edx, dword[GetContextReg() + offsetof(ppc::PPCContext, r[12])]);
+    if (has_movbe) {
+      movbe(dword[GetMembaseReg() + rax + lr_slot_offset], edx);
+    } else {
+      bswap(edx);
+      mov(dword[GetMembaseReg() + rax + lr_slot_offset], edx);
+    }
+    return true;
+  }
+
+  for (unsigned guest_reg = first_gpr; guest_reg <= 31; ++guest_reg) {
+    const int32_t disp =
+        -first_slot_offset + static_cast<int32_t>((guest_reg - first_gpr) * 8);
+    if (has_movbe) {
+      movbe(rdx, qword[GetMembaseReg() + rax + disp]);
+    } else {
+      mov(rdx, qword[GetMembaseReg() + rax + disp]);
+      bswap(rdx);
+    }
+    mov(qword[GetContextReg() + offsetof(ppc::PPCContext, r[guest_reg])], rdx);
+  }
+
+  // The reloaded LR lands in both r12 and lr; 32-bit ops zero the rest of rcx.
+  if (has_movbe) {
+    movbe(ecx, dword[GetMembaseReg() + rax + lr_slot_offset]);
+  } else {
+    mov(ecx, dword[GetMembaseReg() + rax + lr_slot_offset]);
+    bswap(ecx);
+  }
+  mov(qword[GetContextReg() + offsetof(ppc::PPCContext, r[12])], rcx);
+  mov(qword[GetContextReg() + offsetof(ppc::PPCContext, lr)], rcx);
+
+  // __restgprlr_N returns to the reloaded LR: take our epilogue when it is our
+  // own return address, otherwise tail-call it. CallIndirect emits the
+  // indirection lookup and, for a tail call, the stack teardown and jump.
+  cmp(ecx, dword[rsp + StackLayout::GUEST_RET_ADDR]);
+  je(epilog_label(), CodeGenerator::T_NEAR);
+  CallIndirect(instr, rcx);
+  return true;
+}
+
+void X64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
+  assert_not_null(function);
+  ForgetMxcsrMode();
+  if (TryInlinePPCGprLrSaveRestore(instr, function)) {
+    return;
+  }
+
+  auto fn = static_cast<X64Function*>(function);
+  // Resolve address to the function to call and store in rax.
+
+  // Calls to dynamic code look the target up every time, since a direct call
+  // would keep reaching the old copy once the code is rewritten.
+  const bool rewritable = processor()->dynamic_code_enabled() &&
+                          code_cache_->has_indirection_table() &&
+                          !code_cache_->HasIndirectionSlot(function->address());
+  if (fn->machine_code() && !rewritable) {
+    if (!(instr->flags & hir::CALL_TAIL)) {
+      mov(rcx, qword[rsp + StackLayout::GUEST_CALL_RET_ADDR]);
+
+      call((void*)fn->machine_code());
+      synchronize_stack_on_next_instruction_ = true;
+    } else {
+      // tail call
+      EmitTraceUserCallReturn();
+      EmitProfilerEpilogue();
+      // Pass the callers return address over.
+      mov(rcx, qword[rsp + StackLayout::GUEST_RET_ADDR]);
+
+      add(rsp, static_cast<uint32_t>(stack_size()));
+      PopStackpoint();
+      jmp((void*)fn->machine_code(), T_NEAR);
+    }
+
+    return;
+  } else if (code_cache_->has_indirection_table() &&
+             code_cache_->HasIndirectionSlot(function->address())) {
+    // Must leave the guest address in edx for the resolve thunk to read.
+    mov(edx, function->address());
+    if (!code_cache_->encoded_indirection()) {
+      // Fast path: table mapped at host VA == guest addr; slot holds raw
+      // 32-bit host target.
+      mov(eax, dword[rdx]);
+    } else {
+      // Encoded path: see X64CodeCache for the entry format.
+      Xbyak::Label external_target;
+      Xbyak::Label indirection_ready;
+
+      mov(r8, code_cache_->indirection_table_base_bias());
+      mov(eax, dword[r8 + rdx]);
+      test(eax, eax);
+      js(external_target);
+
+      // Internal: rel32 from code cache base.
+      mov(r8, code_cache_->execute_base_address());
+      add(rax, r8);
+      jmp(indirection_ready);
+
+      // External: tagged index into the side table.
+      L(external_target);
+      and_(eax, X64CodeCache::kIndirectionExternalIndexMask);
+      mov(r8, code_cache_->external_indirection_table_base_address());
+      mov(rax, qword[r8 + rax * 8]);
+
+      L(indirection_ready);
+    }
+  } else if (code_cache_->has_indirection_table()) {
+    mov(edx, function->address());
+    EmitDynamicCallLookup(*this, (instr->flags & hir::CALL_TAIL) != 0, true);
+  } else {
+    // Old-style resolve.
+    // Not too important because indirection table is almost always available.
+    // TODO: Overwrite the call-site with a straight call.
+    CallNative(&ResolveFunction, function->address());
+  }
+
+  // Actually jump/call to rax.
+  if (instr->flags & hir::CALL_TAIL) {
+    // Since we skip the prolog we need to mark the return here.
+    EmitTraceUserCallReturn();
+    EmitProfilerEpilogue();
+    // Pass the callers return address over.
+    mov(rcx, qword[rsp + StackLayout::GUEST_RET_ADDR]);
+
+    add(rsp, static_cast<uint32_t>(stack_size()));
+    PopStackpoint();
+    jmp(rax);
+  } else {
+    // Return address is from the previous SET_RETURN_ADDRESS.
+    mov(rcx, qword[rsp + StackLayout::GUEST_CALL_RET_ADDR]);
+
+    call(rax);
+    synchronize_stack_on_next_instruction_ = true;
+  }
+}
+
+void X64Emitter::CallIndirect(const hir::Instr* instr,
+                              const Xbyak::Reg64& reg) {
+  ForgetMxcsrMode();
+  // Check if return.
+  if (instr->flags & hir::CALL_POSSIBLE_RETURN) {
+    cmp(reg.cvt32(), dword[rsp + StackLayout::GUEST_RET_ADDR]);
+    je(epilog_label(), CodeGenerator::T_NEAR);
+  }
+
+  if (code_cache_->has_indirection_table()) {
+    // Must leave the guest address in edx for the resolve thunk to read.
+    if (reg.cvt32() != edx) {
+      mov(edx, reg.cvt32());
+    }
+    // A target without an indirection slot goes through the dynamic call cache.
+    // Only dynamic code has such targets, and the check costs code cache space
+    // at every call site, which the largest titles already nearly fill.
+    Xbyak::Label* target_ready = nullptr;
+    if (processor()->dynamic_code_enabled()) {
+      target_ready = &NewCachedLabel();
+      mov(eax, edx);
+      sub(eax, code_cache_->indirection_guest_base());
+      cmp(eax, code_cache_->indirection_guest_size());
+      const bool tail_call = (instr->flags & hir::CALL_TAIL) != 0;
+      const bool possible_return =
+          tail_call && (instr->flags & hir::CALL_POSSIBLE_RETURN) &&
+          cvars::enable_host_guest_stack_synchronization;
+      Xbyak::Label& resolve_natively =
+          AddToTail([target_ready, tail_call, possible_return](
+                        X64Emitter& e, Xbyak::Label& tail) {
+            e.L(tail);
+            if (possible_return) {
+              Xbyak::Address in_body = e.GetBackendCtxPtr(
+                  offsetof(X64BackendContext, dynamic_target_in_body));
+              in_body.setBit(32);
+              e.mov(in_body, 0);
+            }
+            EmitDynamicCallLookup(e, tail_call);
+            if (possible_return) {
+              e.EmitDropCallingFrame();
+            }
+            e.jmp(*target_ready, X64Emitter::T_NEAR);
+          });
+      jae(resolve_natively, T_NEAR);
+    }
+    // Without dynamic code, a target the table doesn't cover goes to the
+    // resolve thunk, since its slot would be read from whatever the host maps
+    // there. Returns, the most common sites, are left to RedirectUncoveredCall.
+    Xbyak::Label table_slot;
+    Xbyak::Label slot_ready;
+    const bool check_range = !processor()->dynamic_code_enabled() &&
+                             !(instr->flags & hir::CALL_POSSIBLE_RETURN);
+    if (check_range) {
+      mov(eax, edx);
+      sub(eax, code_cache_->indirection_guest_base());
+      cmp(eax, code_cache_->indirection_guest_size());
+      jb(table_slot, T_SHORT);
+      mov(rax, reinterpret_cast<uint64_t>(backend()->resolve_function_thunk()));
+      jmp(slot_ready, code_cache_->encoded_indirection() ? T_NEAR : T_SHORT);
+      L(table_slot);
+    }
+    if (!code_cache_->encoded_indirection()) {
+      // Fast path: table mapped at host VA == guest addr; slot holds raw
+      // 32-bit host target.
+      mov(eax, dword[rdx]);
+    } else {
+      // Encoded path: see X64CodeCache for the entry format.
+      Xbyak::Label external_target;
+      Xbyak::Label indirection_ready;
+
+      mov(r8, code_cache_->indirection_table_base_bias());
+      mov(eax, dword[r8 + rdx]);
+      test(eax, eax);
+      js(external_target);
+
+      // Internal: rel32 from code cache base.
+      mov(r8, code_cache_->execute_base_address());
+      add(rax, r8);
+      jmp(indirection_ready);
+
+      // External: tagged index into the side table.
+      L(external_target);
+      and_(eax, X64CodeCache::kIndirectionExternalIndexMask);
+      mov(r8, code_cache_->external_indirection_table_base_address());
+      mov(rax, qword[r8 + rax * 8]);
+
+      L(indirection_ready);
+    }
+    if (check_range) {
+      L(slot_ready);
+    }
+    if (target_ready) {
+      L(*target_ready);
+    }
+  } else {
+    // Old-style resolve.
+    // Not too important because indirection table is almost always available.
+    mov(edx, reg.cvt32());
+    mov(rax, reinterpret_cast<uint64_t>(ResolveFunction));
+    mov(rcx, GetContextReg());
+    call(rax);
+  }
+
+  // Actually jump/call to rax.
+  if (instr->flags & hir::CALL_TAIL) {
+    // Since we skip the prolog we need to mark the return here.
+    EmitTraceUserCallReturn();
+    EmitProfilerEpilogue();
+    // Pass the callers return address over.
+    mov(rcx, qword[rsp + StackLayout::GUEST_RET_ADDR]);
+
+    add(rsp, static_cast<uint32_t>(stack_size()));
+    PopStackpoint();
+    jmp(rax);
+  } else {
+    // Return address is from the previous SET_RETURN_ADDRESS.
+    mov(rcx, qword[rsp + StackLayout::GUEST_CALL_RET_ADDR]);
+
+    call(rax);
+    synchronize_stack_on_next_instruction_ = true;
+  }
+}
+
+uint64_t UndefinedCallExtern(void* raw_context, uint64_t function_ptr) {
+  auto function = reinterpret_cast<Function*>(function_ptr);
+  if (!cvars::ignore_undefined_externs) {
+    xe::FatalError(fmt::format("undefined extern call to {:08X} {}",
+                               function->address(), function->name().c_str()));
+  } else {
+    XELOGE("undefined extern call to {:08X} {}", function->address(),
+           function->name());
+  }
+  return 0;
+}
+void X64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
+  ForgetMxcsrMode();
+  bool undefined = true;
+  if (function->behavior() == Function::Behavior::kBuiltin) {
+    auto builtin_function = static_cast<const BuiltinFunction*>(function);
+    if (builtin_function->handler()) {
+      undefined = false;
+      // rcx = target function
+      // rdx = arg0
+      // r8  = arg1
+      // r9  = arg2
+      mov(rcx, reinterpret_cast<uint64_t>(builtin_function->handler()));
+      mov(rdx, reinterpret_cast<uint64_t>(builtin_function->arg0()));
+      mov(r8, reinterpret_cast<uint64_t>(builtin_function->arg1()));
+      call(backend()->guest_to_host_thunk());
+      // rax = host return
+    }
+  } else if (function->behavior() == Function::Behavior::kExtern) {
+    auto extern_function = static_cast<const GuestFunction*>(function);
+    if (extern_function->extern_handler()) {
+      undefined = false;
+      // rcx = target function
+      // rdx = arg0
+      // r8  = arg1
+      // r9  = arg2
+      mov(rcx, reinterpret_cast<uint64_t>(extern_function->extern_handler()));
+      mov(rdx,
+          qword[GetContextReg() + offsetof(ppc::PPCContext, kernel_state)]);
+      call(backend()->guest_to_host_thunk());
+      // rax = host return
+    }
+  }
+  if (undefined) {
+    CallNative(UndefinedCallExtern, reinterpret_cast<uint64_t>(function));
+  }
+}
+
+void X64Emitter::CallNative(void* fn) { CallNativeSafe(fn); }
+
+void X64Emitter::CallNative(uint64_t (*fn)(void* raw_context)) {
+  CallNativeSafe(reinterpret_cast<void*>(fn));
+}
+
+void X64Emitter::CallNative(uint64_t (*fn)(void* raw_context, uint64_t arg0)) {
+  CallNativeSafe(reinterpret_cast<void*>(fn));
+}
+
+void X64Emitter::CallNative(uint64_t (*fn)(void* raw_context, uint64_t arg0),
+                            uint64_t arg0) {
+  mov(GetNativeParam(0), arg0);
+  CallNativeSafe(reinterpret_cast<void*>(fn));
+}
+
+void X64Emitter::CallNativeSafe(void* fn) {
+  // The thunk restores mxcsr_fpu, so a tracked VMX mode is stale afterwards.
+  ForgetMxcsrMode();
+  // rcx = target function
+  // rdx = arg0
+  // r8  = arg1
+  // r9  = arg2
+  mov(rcx, reinterpret_cast<uint64_t>(fn));
+  call(backend()->guest_to_host_thunk());
+  // rax = host return
+}
+
+void X64Emitter::SetReturnAddress(uint64_t value) {
+  mov(rax, value);
+  mov(qword[rsp + StackLayout::GUEST_CALL_RET_ADDR], rax);
+}
+
+Xbyak::Reg64 X64Emitter::GetNativeParam(uint32_t param) {
+  if (param == 0) {
+    return rdx;
+  } else if (param == 1) {
+    return r8;
+  } else if (param == 2) {
+    return r9;
+  }
+
+  assert_always();
+  return r9;
+}
+
+// Important: If you change these, you must update the thunks in x64_backend.cc!
+Xbyak::Reg64 X64Emitter::GetContextReg() const { return rsi; }
+Xbyak::Reg64 X64Emitter::GetMembaseReg() const { return rdi; }
+
+void X64Emitter::ReloadMembase() {
+  mov(GetMembaseReg(),
+      qword[GetContextReg() +
+            offsetof(ppc::PPCContext, virtual_membase)]);  // membase
+}
+
+// Len Assembly                                   Byte Sequence
+// ============================================================================
+// 1b  NOP                                        90H
+// 2b  66 NOP                                     66 90H
+// 3b  NOP DWORD ptr [EAX]                        0F 1F 00H
+// 4b  NOP DWORD ptr [EAX + 00H]                  0F 1F 40 00H
+// 5b  NOP DWORD ptr [EAX + EAX*1 + 00H]          0F 1F 44 00 00H
+// 6b  66 NOP DWORD ptr [EAX + EAX*1 + 00H]       66 0F 1F 44 00 00H
+// 7b  NOP DWORD ptr [EAX + 00000000H]            0F 1F 80 00 00 00 00H
+// 8b  NOP DWORD ptr [EAX + EAX*1 + 00000000H]    0F 1F 84 00 00 00 00 00H
+// 9b  66 NOP DWORD ptr [EAX + EAX*1 + 00000000H] 66 0F 1F 84 00 00 00 00 00H
+void X64Emitter::nop(size_t length) {
+  for (size_t i = 0; i < length; ++i) {
+    db(0x90);
+  }
+}
+
+bool X64Emitter::ConstantFitsIn32Reg(uint64_t v) {
+  if ((v & ~0x7FFFFFFF) == 0) {
+    // Fits under 31 bits, so just load using normal mov.
+    return true;
+  } else if ((v & ~0x7FFFFFFF) == ~0x7FFFFFFF) {
+    // Negative number that fits in 32bits.
+    return true;
+  }
+  return false;
+}
+/*
+    WARNING: do not use any regs here, addr is often produced by
+   ComputeAddressOffset, which may use rax/rdx/rcx in its addr expression
+*/
+void X64Emitter::MovMem64(const Xbyak::RegExp& addr, uint64_t v) {
+  uint32_t lowpart = static_cast<uint32_t>(v);
+  uint32_t highpart = static_cast<uint32_t>(v >> 32);
+  if ((v & ~0x7FFFFFFF) == 0) {
+    // Fits under 31 bits, so just load using normal mov.
+
+    mov(qword[addr], v);
+  } else if ((v & ~0x7FFFFFFF) == ~0x7FFFFFFF) {
+    // Negative number that fits in 32bits.
+    mov(qword[addr], v);
+  } else if (!highpart) {
+    // All high bits are zero. It'd be nice if we had a way to load a 32bit
+    // immediate without sign extending!
+    // TODO(benvanik): this is super common, find a better way.
+    if (lowpart == 0 && CanUseMembaseLow32As0()) {
+      mov(dword[addr], GetMembaseReg().cvt32());
+    } else {
+      mov(dword[addr], static_cast<uint32_t>(v));
+    }
+    if (CanUseMembaseLow32As0()) {
+      mov(dword[addr + 4], GetMembaseReg().cvt32());
+    } else {
+      mov(dword[addr + 4], 0);
+    }
+  } else {
+    // 64bit number that needs double movs.
+
+    if (lowpart == 0 && CanUseMembaseLow32As0()) {
+      mov(dword[addr], GetMembaseReg().cvt32());
+    } else {
+      mov(dword[addr], lowpart);
+    }
+    if (highpart == 0 && CanUseMembaseLow32As0()) {
+      mov(dword[addr + 4], GetMembaseReg().cvt32());
+    } else {
+      mov(dword[addr + 4], highpart);
+    }
+  }
+}
+static constexpr vec128_t v128_setr_bytes(
+    unsigned char v0, unsigned char v1, unsigned char v2, unsigned char v3,
+    unsigned char v4, unsigned char v5, unsigned char v6, unsigned char v7,
+    unsigned char v8, unsigned char v9, unsigned char v10, unsigned char v11,
+    unsigned char v12, unsigned char v13, unsigned char v14,
+    unsigned char v15) {
+  vec128_t result{};
+
+  result.u8[0] = v0;
+  result.u8[1] = v1;
+  result.u8[2] = v2;
+  result.u8[3] = v3;
+  result.u8[4] = v4;
+  result.u8[5] = v5;
+  result.u8[6] = v6;
+  result.u8[7] = v7;
+  result.u8[8] = v8;
+  result.u8[9] = v9;
+  result.u8[10] = v10;
+  result.u8[11] = v11;
+  result.u8[12] = v12;
+  result.u8[13] = v13;
+  result.u8[14] = v14;
+
+  result.u8[15] = v15;
+  return result;
+}
+
+static constexpr vec128_t v128_setr_words(uint32_t v0, uint32_t v1, uint32_t v2,
+                                          uint32_t v3) {
+  vec128_t result{};
+  result.u32[0] = v0;
+  result.u32[1] = v1;
+  result.u32[2] = v2;
+  result.u32[3] = v3;
+  return result;
+}
+
+// constinit keeps this out of .bss: a dynamically initialized copy loses
+// stores that land on a fresh page under Rosetta 2.
+static constinit const vec128_t xmm_consts[] = {
+    /* XMMZero                */ vec128f(0.0f),
+    /* XMMByteSwapMask        */
+    vec128i(0x00010203u, 0x04050607u, 0x08090A0Bu, 0x0C0D0E0Fu),
+    /* XMMOne                 */ vec128f(1.0f),
+    /* XMMOnePD               */ vec128d(1.0),
+    /* XMMNegativeOne         */ vec128f(-1.0f, -1.0f, -1.0f, -1.0f),
+    /* XMMFFFF                */
+    vec128i(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu),
+    /* XMMMaskX16Y16          */
+    vec128i(0x0000FFFFu, 0xFFFF0000u, 0x00000000u, 0x00000000u),
+    /* XMMFlipX16Y16          */
+    vec128i(0x00008000u, 0x00000000u, 0x00000000u, 0x00000000u),
+    /* XMMFixX16Y16           */ vec128f(-32768.0f, 0.0f, 0.0f, 0.0f),
+    /* XMMNormalizeX16Y16     */
+    vec128f(1.0f / 32767.0f, 1.0f / (32767.0f * 65536.0f), 0.0f, 0.0f),
+    /* XMM0001                */ vec128f(0.0f, 0.0f, 0.0f, 1.0f),
+    /* XMM3301                */ vec128f(3.0f, 3.0f, 0.0f, 1.0f),
+    /* XMM3331                */ vec128f(3.0f, 3.0f, 3.0f, 1.0f),
+    /* XMM3333                */ vec128f(3.0f, 3.0f, 3.0f, 3.0f),
+    /* XMMSignMaskPS          */
+    vec128i(0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u),
+    /* XMMSignMaskPD          */
+    vec128i(0x00000000u, 0x80000000u, 0x00000000u, 0x80000000u),
+    /* XMMAbsMaskPS           */
+    vec128i(0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu),
+    /* XMMAbsMaskPD           */
+    vec128i(0xFFFFFFFFu, 0x7FFFFFFFu, 0xFFFFFFFFu, 0x7FFFFFFFu),
+
+    /* XMMByteOrderMask       */
+    vec128i(0x01000302u, 0x05040706u, 0x09080B0Au, 0x0D0C0F0Eu),
+    /* XMMPermuteControl15    */ vec128b(15),
+    /* XMMPermuteByteMask     */ vec128b(0x1F),
+    /* XMMPackD3DCOLORSat     */ vec128i(0x404000FFu),
+    /* XMMPackD3DCOLOR        */
+    vec128i(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0x0C000408u),
+    /* XMMUnpackD3DCOLOR      */
+    vec128i(0xFFFFFF0Eu, 0xFFFFFF0Du, 0xFFFFFF0Cu, 0xFFFFFF0Fu),
+    /* XMMPackFLOAT16_2       */
+    vec128i(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0x01000302u),
+    /* XMMUnpackFLOAT16_2     */
+    vec128i(0x0D0C0F0Eu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu),
+    /* XMMPackFLOAT16_4       */
+    vec128i(0xFFFFFFFFu, 0xFFFFFFFFu, 0x01000302u, 0x05040706u),
+    /* XMMUnpackFLOAT16_4     */
+    vec128i(0x09080B0Au, 0x0D0C0F0Eu, 0xFFFFFFFFu, 0xFFFFFFFFu),
+    /* XMMPackSHORT_Min       */ vec128i(0x403F8001u),
+    /* XMMPackSHORT_Max       */ vec128i(0x40407FFFu),
+    /* XMMPackSHORT_NaN       */ vec128i(0x403F8000u),
+    /* XMMPackSHORT_2         */
+    vec128i(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0x01000504u),
+    /* XMMPackSHORT_4         */
+    vec128i(0xFFFFFFFFu, 0xFFFFFFFFu, 0x01000504u, 0x09080D0Cu),
+    /* XMMUnpackSHORT_2       */
+    vec128i(0xFFFF0F0Eu, 0xFFFF0D0Cu, 0xFFFFFFFFu, 0xFFFFFFFFu),
+    /* XMMUnpackSHORT_4       */
+    vec128i(0xFFFF0B0Au, 0xFFFF0908u, 0xFFFF0F0Eu, 0xFFFF0D0Cu),
+    /* XMMUnpackSHORT_Overflow */ vec128i(0x403F8000u),
+    /* XMMPackUINT_2101010_MinUnpacked */
+    vec128i(0x403FFE01u, 0x403FFE01u, 0x403FFE01u, 0x40400000u),
+    /* XMMPackUINT_2101010_MaxUnpacked */
+    vec128i(0x404001FFu, 0x404001FFu, 0x404001FFu, 0x40400003u),
+    /* XMMPackUINT_2101010_NaN */
+    vec128i(0x403FFE00u, 0x403FFE00u, 0x403FFE00u, 0x40400000u),
+    /* XMMPackUINT_2101010_MaskUnpacked */
+    vec128i(0x3FFu, 0x3FFu, 0x3FFu, 0x3u),
+    /* XMMPackUINT_2101010_MaskPacked */
+    vec128i(0x3FFu, 0x3FFu << 10, 0x3FFu << 20, 0x3u << 30),
+    /* XMMPackUINT_2101010_Shift */ vec128i(0, 10, 20, 30),
+    /* XMMUnpackUINT_2101010_Overflow */ vec128i(0x403FFE00u),
+    /* XMMPackULONG_4202020_MinUnpacked */
+    vec128i(0x40380001u, 0x40380001u, 0x40380001u, 0x40400000u),
+    /* XMMPackULONG_4202020_MaxUnpacked */
+    vec128i(0x4047FFFFu, 0x4047FFFFu, 0x4047FFFFu, 0x4040000Fu),
+    /* XMMPackULONG_4202020_NaN */
+    vec128i(0x40380000u, 0x40380000u, 0x40380000u, 0x40400000u),
+    /* XMMPackULONG_4202020_MaskUnpacked */
+    vec128i(0xFFFFFu, 0xFFFFFu, 0xFFFFFu, 0xFu),
+    /* XMMPackULONG_4202020_PermuteXZ */
+    vec128i(0xFFFFFFFFu, 0xFFFFFFFFu, 0x0A0908FFu, 0xFF020100u),
+    /* XMMPackULONG_4202020_PermuteYW */
+    vec128i(0xFFFFFFFFu, 0xFFFFFFFFu, 0x0CFFFF06u, 0x0504FFFFu),
+    /* XMMUnpackULONG_4202020_Permute */
+    vec128i(0xFF0E0D0Cu, 0xFF0B0A09u, 0xFF080F0Eu, 0xFFFFFF0Bu),
+    /* XMMUnpackULONG_4202020_Overflow */ vec128i(0x40380000u),
+    /* XMMOneOver255          */ vec128f(1.0f / 255.0f),
+    /* XMMMaskEvenPI16        */
+    vec128i(0x0000FFFFu, 0x0000FFFFu, 0x0000FFFFu, 0x0000FFFFu),
+    /* XMMShiftMaskEvenPI16   */
+    vec128i(0x0000000Fu, 0x0000000Fu, 0x0000000Fu, 0x0000000Fu),
+    /* XMMShiftMaskPS         */
+    vec128i(0x0000001Fu, 0x0000001Fu, 0x0000001Fu, 0x0000001Fu),
+    /* XMMShiftByteMask       */
+    vec128i(0x000000FFu, 0x000000FFu, 0x000000FFu, 0x000000FFu),
+    /* XMMSwapWordMask        */
+    vec128i(0x03030303u, 0x03030303u, 0x03030303u, 0x03030303u),
+    /* XMMUnsignedDwordMax    */
+    vec128i(0xFFFFFFFFu, 0x00000000u, 0xFFFFFFFFu, 0x00000000u),
+    /* XMM255                 */ vec128f(255.0f),
+    /* XMMPI32                */ vec128i(32),
+    /* XMMSignMaskI8          */
+    vec128i(0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u),
+    /* XMMSignMaskI16         */
+    vec128i(0x80008000u, 0x80008000u, 0x80008000u, 0x80008000u),
+    /* XMMSignMaskI32         */
+    vec128i(0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u),
+    /* XMMSignMaskF32         */
+    vec128i(0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u),
+    /* XMMShortMinPS          */ vec128f(SHRT_MIN),
+    /* XMMShortMaxPS          */ vec128f(SHRT_MAX),
+    /* XMMIntMin              */ vec128i(INT_MIN),
+    /* XMMIntMax              */ vec128i(INT_MAX),
+    /* XMMIntMaxPD            */ vec128d(INT_MAX),
+    /* XMMPosIntMinPS         */ vec128f((float)0x80000000u),
+    /* XMMQNaN                */ vec128i(0x7FC00000u),
+    /* XMMInt127              */ vec128i(0x7Fu),
+    /* XMM2To32               */ vec128f(0x1.0p32f),
+    /* XMMFloatInf */ vec128i(0x7f800000),
+
+    /* XMMIntsToBytes*/
+    v128_setr_bytes(0, 4, 8, 12, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                    0x80, 0x80, 0x80, 0x80),
+    /*XMMShortsToBytes*/
+    v128_setr_bytes(0, 2, 4, 6, 8, 10, 12, 14, 0x80, 0x80, 0x80, 0x80, 0x80,
+                    0x80, 0x80, 0x80),
+    /*XMMLVSLTableBase*/
+    vec128b(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+    /*XMMLVSRTableBase*/
+    vec128b(16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31),
+    /* XMMSingleDenormalMask */
+    vec128i(0x7f800000),
+    /* XMMThreeFloatMask */
+    vec128i(~0U, ~0U, ~0U, 0U),
+    /*
+        XMMF16UnpackLCPI2
+        */
+
+    vec128i(0x38000000),
+    /*
+                XMMF16UnpackLCPI3
+        */
+    vec128q(0x7fe000007fe000ULL),
+
+    /* XMMF16PackLCPI0 (exponent bias) */
+    vec128i(0x8000000),
+    /*XMMF16PackLCPI2*/
+    vec128i(0x47ffe000),
+    /*XMMF16PackLCPI3*/
+    vec128i(0xc7800000),
+    /*XMMF16PackLCPI4
+     */
+    vec128i(0xf7fdfff),
+    /*XMMF16PackLCPI5*/
+    vec128i(0x7fff),
+    /*
+    XMMF16PackLCPI6
+    */
+    vec128i(0x8000),
+    /* XMMXOPByteShiftMask,*/
+    vec128b(7),
+    /*XMMXOPWordShiftMask*/
+    vec128s(15),
+    /*XMMXOPDwordShiftMask*/
+    vec128i(31),
+    // XMMShiftBitsPowers: 2^count by count
+    v128_setr_bytes(1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0),
+    // XMMShiftBitsInversePowers: 2^(7 - count) by count
+    v128_setr_bytes(128, 64, 32, 16, 8, 4, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0),
+    // XMMShlBitsEvenWindows: guest byte 2k high, 2k + 1 low, in word k. Also
+    // vsr's odd windows.
+    v128_setr_bytes(2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13),
+    // XMMShlBitsOddWindows: guest byte 2k + 1 high, 2k + 2 low
+    v128_setr_bytes(1, 2, 7, 0, 5, 6, 11, 4, 9, 10, 15, 8, 13, 14, 0x80, 12),
+    // XMMShrBitsEvenWindows: guest byte 2k - 1 high, 2k low
+    v128_setr_bytes(3, 0x80, 1, 2, 7, 0, 5, 6, 11, 4, 9, 10, 15, 8, 13, 14),
+    // XMMShiftBitsEvenCounts: guest byte 2k in word k, zero-extended
+    v128_setr_bytes(3, 0x80, 1, 0x80, 7, 0x80, 5, 0x80, 11, 0x80, 9, 0x80, 15,
+                    0x80, 13, 0x80),
+    // XMMShiftBitsOddCounts: guest byte 2k + 1 in word k, zero-extended
+    v128_setr_bytes(2, 0x80, 0, 0x80, 6, 0x80, 4, 0x80, 10, 0x80, 8, 0x80, 14,
+                    0x80, 12, 0x80),
+    // XMMShiftBitsHighBytes
+    vec128s(0xFF00),
+    // XMMQuietBit
+    vec128i(0x00400000u),
+    // XMMDoubleToSingleTruncateMask
+    vec128q(0xFFFFFFFFE0000000ull),
+    // XMMSingleRangeBias: takes a double's bits without the sign, shifted up
+    // by one, from 2^-149 up to the smallest signed value
+    vec128q(0x12C0000000000000ull),
+    // XMMSingleRangeLimit: the last of them below 2^128
+    vec128q(0xA29FFFFFFFFFFFFFull),
+    // XMMVmsumInverseGridBase: 1023 + 28 + 254, the biased exponent of the
+    // inverse grid plus the exponent sum
+    vec128i(1305),
+    // XMMVmsumGridSum: the grid's and the inverse grid's exponent fields add
+    // up to 2046
+    vec128q(2046ull << 52),
+    // XMMVmsum3Adjust and XMMVmsum4Adjust: -s * k and -s, for s the majority
+    // sign and k the number of products of the other sign, by the number of
+    // negative products
+    vec128q(0x8000000000000000ull, 0xBFF0000000000000ull),  // -0, -1
+    vec128q(0xBFF0000000000000ull, 0xBFF0000000000000ull),  // -1, -1
+    vec128q(0x3FF0000000000000ull, 0x3FF0000000000000ull),  // 1, 1
+    vec128q(0x8000000000000000ull, 0x3FF0000000000000ull),  // -0, 1
+    vec128q(0x8000000000000000ull, 0xBFF0000000000000ull),  // -0, -1
+    vec128q(0xBFF0000000000000ull, 0xBFF0000000000000ull),  // -1, -1
+    vec128q(0xC000000000000000ull, 0xBFF0000000000000ull),  // -2, -1
+    vec128q(0x3FF0000000000000ull, 0x3FF0000000000000ull),  // 1, 1
+    vec128q(0x8000000000000000ull, 0x3FF0000000000000ull),  // -0, 1
+    // XMMVRefpStepMask
+    vec128i(0x1FF),
+    // XMMVRefpSlopeMask
+    vec128i(0xFFFF),
+    // XMMVRefpMantissaMask
+    vec128i(0x7FFFFF),
+    // XMMVRefpExponentBias: 253 << 23
+    vec128i(0x7E800000),
+    // XMMVRefpLargeLimit: above it, the result is too small and flushes
+    vec128i(0x7E7FFFFF),
+    // XMMVRefpSmallestNormal
+    vec128i(0x00800000),
+    // XMMEstimateIndexMask: the 11 bits that index the vlogefp and vexptefp
+    // tables
+    vec128i(0x7FF),
+    // XMMEstimateExponentMask
+    vec128i(0xFF),
+    // XMMVLogeExponentBias
+    vec128i(127),
+    // XMMVLogeScale: the result is in 2048ths
+    vec128f(1.0f / 2048.0f),
+    // XMMVLogeZeroResult: -infinity
+    vec128i(0xFF800000),
+    // XMMVExpteShiftBase: the mantissa shifts right by this minus the
+    // exponent, for 15 fraction bits
+    vec128i(135),
+    // XMMVExpteExponentBias: 127, less the table's implicit bit
+    vec128i(126),
+    // XMMVExpteSmallestExponent: below it, the result flushes to zero
+    vec128i(static_cast<uint32_t>(-126)),
+    // XMMVExpteLargestInputExponent: above it (from 128 up), the result is
+    // infinity, or zero for a negative input
+    vec128i(133),
+    // XMMVRefpTable: base >> 9 in the upper half, slope in the lower, for the
+    // segments of ppc_estimates.cc's kReciprocalBase and kReciprocalSlope
+    v128_setr_words(0x7FFC03E1, 0x7C1C03A7, 0x78750371, 0x75040340),
+    v128_setr_words(0x71C40313, 0x6EB102EA, 0x6BC802C4, 0x690402A0),
+    v128_setr_words(0x6664027F, 0x63E50261, 0x61840245, 0x5F40022A),
+    v128_setr_words(0x5D160212, 0x5B0401FB, 0x590A01E5, 0x572501D1),
+    v128_setr_words(0x555401BE, 0x539601AC, 0x51EB019B, 0x504F018B),
+    v128_setr_words(0x4EC4017C, 0x4D48016E, 0x4BD7015B, 0x4A7C015B),
+    v128_setr_words(0x49220143, 0x47DF0143, 0x469C012D, 0x456F012D),
+    v128_setr_words(0x4442011A, 0x4328011A, 0x420E0108, 0x41060106),
+    // XMMVRsqrteTableStart
+    v128_setr_words(0x568B4FD, 0x4F3AF97, 0x48DAAA5, 0x435A618),
+    v128_setr_words(0x3E7A1E4, 0x3A29DFE, 0x3659A5C, 0x32E96F8),
+    v128_setr_words(0x2FC93CA, 0x2D090CE, 0x2A88DFE, 0x2838B57),
+    v128_setr_words(0x26188D4, 0x2438673, 0x2268431, 0x20B820B),
+    v128_setr_words(0x3D27FFA, 0x3807C29, 0x33878AA, 0x2F97572),
+    v128_setr_words(0x2C27279, 0x2926FB7, 0x2666D26, 0x23F6AC0),
+    v128_setr_words(0x21D6881, 0x1FD6665, 0x1E16468, 0x1C76287),
+    v128_setr_words(0x1AF60C1, 0x1995F12, 0x1855D79, 0x1735BF4),
+    // XMMVRsqrteTableBase
+    vec128i(0),  // filled in later
+    // XMMLVLTable
+    v128_setr_bytes(0x03, 0x02, 0x01, 0x00, 0x07, 0x06, 0x05, 0x04, 0x0B, 0x0A,
+                    0x09, 0x08, 0x0F, 0x0E, 0x0D, 0x0C),
+    v128_setr_bytes(0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05, 0x0C, 0x0B,
+                    0x0A, 0x09, 0x80, 0x0F, 0x0E, 0x0D),
+    v128_setr_bytes(0x05, 0x04, 0x03, 0x02, 0x09, 0x08, 0x07, 0x06, 0x0D, 0x0C,
+                    0x0B, 0x0A, 0x80, 0x80, 0x0F, 0x0E),
+    v128_setr_bytes(0x06, 0x05, 0x04, 0x03, 0x0A, 0x09, 0x08, 0x07, 0x0E, 0x0D,
+                    0x0C, 0x0B, 0x80, 0x80, 0x80, 0x0F),
+    v128_setr_bytes(0x07, 0x06, 0x05, 0x04, 0x0B, 0x0A, 0x09, 0x08, 0x0F, 0x0E,
+                    0x0D, 0x0C, 0x80, 0x80, 0x80, 0x80),
+    v128_setr_bytes(0x08, 0x07, 0x06, 0x05, 0x0C, 0x0B, 0x0A, 0x09, 0x80, 0x0F,
+                    0x0E, 0x0D, 0x80, 0x80, 0x80, 0x80),
+    v128_setr_bytes(0x09, 0x08, 0x07, 0x06, 0x0D, 0x0C, 0x0B, 0x0A, 0x80, 0x80,
+                    0x0F, 0x0E, 0x80, 0x80, 0x80, 0x80),
+    v128_setr_bytes(0x0A, 0x09, 0x08, 0x07, 0x0E, 0x0D, 0x0C, 0x0B, 0x80, 0x80,
+                    0x80, 0x0F, 0x80, 0x80, 0x80, 0x80),
+    v128_setr_bytes(0x0B, 0x0A, 0x09, 0x08, 0x0F, 0x0E, 0x0D, 0x0C, 0x80, 0x80,
+                    0x80, 0x80, 0x80, 0x80, 0x80, 0x80),
+    v128_setr_bytes(0x0C, 0x0B, 0x0A, 0x09, 0x80, 0x0F, 0x0E, 0x0D, 0x80, 0x80,
+                    0x80, 0x80, 0x80, 0x80, 0x80, 0x80),
+    v128_setr_bytes(0x0D, 0x0C, 0x0B, 0x0A, 0x80, 0x80, 0x0F, 0x0E, 0x80, 0x80,
+                    0x80, 0x80, 0x80, 0x80, 0x80, 0x80),
+    v128_setr_bytes(0x0E, 0x0D, 0x0C, 0x0B, 0x80, 0x80, 0x80, 0x0F, 0x80, 0x80,
+                    0x80, 0x80, 0x80, 0x80, 0x80, 0x80),
+    v128_setr_bytes(0x0F, 0x0E, 0x0D, 0x0C, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                    0x80, 0x80, 0x80, 0x80, 0x80, 0x80),
+    v128_setr_bytes(0x80, 0x0F, 0x0E, 0x0D, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                    0x80, 0x80, 0x80, 0x80, 0x80, 0x80),
+    v128_setr_bytes(0x80, 0x80, 0x0F, 0x0E, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                    0x80, 0x80, 0x80, 0x80, 0x80, 0x80),
+    v128_setr_bytes(0x80, 0x80, 0x80, 0x0F, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                    0x80, 0x80, 0x80, 0x80, 0x80, 0x80),
+    // XMMLVRTable
+    v128_setr_bytes(0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                    0x80, 0x80, 0x80, 0x80, 0x80, 0x80),
+    v128_setr_bytes(0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                    0x80, 0x80, 0x00, 0x80, 0x80, 0x80),
+    v128_setr_bytes(0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                    0x80, 0x80, 0x01, 0x00, 0x80, 0x80),
+    v128_setr_bytes(0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                    0x80, 0x80, 0x02, 0x01, 0x00, 0x80),
+    v128_setr_bytes(0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                    0x80, 0x80, 0x03, 0x02, 0x01, 0x00),
+    v128_setr_bytes(0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x80,
+                    0x80, 0x80, 0x04, 0x03, 0x02, 0x01),
+    v128_setr_bytes(0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 0x00,
+                    0x80, 0x80, 0x05, 0x04, 0x03, 0x02),
+    v128_setr_bytes(0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02, 0x01,
+                    0x00, 0x80, 0x06, 0x05, 0x04, 0x03),
+    v128_setr_bytes(0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x03, 0x02,
+                    0x01, 0x00, 0x07, 0x06, 0x05, 0x04),
+    v128_setr_bytes(0x80, 0x80, 0x80, 0x80, 0x00, 0x80, 0x80, 0x80, 0x04, 0x03,
+                    0x02, 0x01, 0x08, 0x07, 0x06, 0x05),
+    v128_setr_bytes(0x80, 0x80, 0x80, 0x80, 0x01, 0x00, 0x80, 0x80, 0x05, 0x04,
+                    0x03, 0x02, 0x09, 0x08, 0x07, 0x06),
+    v128_setr_bytes(0x80, 0x80, 0x80, 0x80, 0x02, 0x01, 0x00, 0x80, 0x06, 0x05,
+                    0x04, 0x03, 0x0A, 0x09, 0x08, 0x07),
+    v128_setr_bytes(0x80, 0x80, 0x80, 0x80, 0x03, 0x02, 0x01, 0x00, 0x07, 0x06,
+                    0x05, 0x04, 0x0B, 0x0A, 0x09, 0x08),
+    v128_setr_bytes(0x00, 0x80, 0x80, 0x80, 0x04, 0x03, 0x02, 0x01, 0x08, 0x07,
+                    0x06, 0x05, 0x0C, 0x0B, 0x0A, 0x09),
+    v128_setr_bytes(0x01, 0x00, 0x80, 0x80, 0x05, 0x04, 0x03, 0x02, 0x09, 0x08,
+                    0x07, 0x06, 0x0D, 0x0C, 0x0B, 0x0A),
+    v128_setr_bytes(0x02, 0x01, 0x00, 0x80, 0x06, 0x05, 0x04, 0x03, 0x0A, 0x09,
+                    0x08, 0x07, 0x0E, 0x0D, 0x0C, 0x0B),
+};
+static_assert(sizeof(xmm_consts) / sizeof(xmm_consts[0]) == XMMLVRTable + 16,
+              "xmm_consts needs one entry per XmmConst");
+
+void* X64Emitter::FindByteConstantOffset(unsigned bytevalue) {
+  for (auto& vec : xmm_consts) {
+    for (auto& u8 : vec.u8) {
+      if (u8 == bytevalue) {
+        return reinterpret_cast<void*>(backend_->emitter_data() +
+                                       (&u8 - &xmm_consts[0].u8[0]));
+      }
+    }
+  }
+  return nullptr;
+}
+void* X64Emitter::FindWordConstantOffset(unsigned wordvalue) {
+  for (auto& vec : xmm_consts) {
+    for (auto& u16 : vec.u16) {
+      if (u16 == wordvalue) {
+        return reinterpret_cast<void*>(backend_->emitter_data() +
+                                       ((&u16 - &xmm_consts[0].u16[0]) * 2));
+      }
+    }
+  }
+  return nullptr;
+}
+void* X64Emitter::FindDwordConstantOffset(unsigned dwordvalue) {
+  for (auto& vec : xmm_consts) {
+    for (auto& u32 : vec.u32) {
+      if (u32 == dwordvalue) {
+        return reinterpret_cast<void*>(backend_->emitter_data() +
+                                       ((&u32 - &xmm_consts[0].u32[0]) * 4));
+      }
+    }
+  }
+  return nullptr;
+}
+void* X64Emitter::FindQwordConstantOffset(uint64_t qwordvalue) {
+  for (auto& vec : xmm_consts) {
+    for (auto& u64 : vec.u64) {
+      if (u64 == qwordvalue) {
+        return reinterpret_cast<void*>(backend_->emitter_data() +
+                                       ((&u64 - &xmm_consts[0].u64[0]) * 8));
+      }
+    }
+  }
+  return nullptr;
+}
+// First location to try and place constants.
+static constexpr uintptr_t kConstDataLocation = 0x20000000;
+static constexpr uintptr_t kConstDataSize = sizeof(xmm_consts);
+
+// Increment the location by this amount for every allocation failure.
+static constexpr uintptr_t kConstDataIncrement = 0x00001000;
+
+// This function places constant data that is used by the emitter later on.
+// Only called once and used by multiple instances of the emitter.
+//
+// TODO(DrChat): This should be placed in the code cache with the code, but
+// doing so requires RIP-relative addressing, which is difficult to support
+// given the current setup.
+uintptr_t X64Emitter::PlaceConstData() {
+  // Constants are accessed via [disp32] in GetXmmConstPtr, so the mapping
+  // must land in the bottom 31 bits. Bound the hint walk so we bail
+  // cleanly instead of looping past 2GB and tripping the assert below.
+  static constexpr uintptr_t kSub2GBLimit = 0x80000000ULL;
+  uint8_t* ptr = reinterpret_cast<uint8_t*>(kConstDataLocation);
+  void* mem = nullptr;
+  while (!mem && reinterpret_cast<uintptr_t>(ptr) < kSub2GBLimit) {
+    mem = memory::AllocFixed(
+        ptr, xe::round_up(kConstDataSize, memory::page_size()),
+        memory::AllocationType::kReserveCommit, memory::PageAccess::kReadWrite);
+
+    ptr += kConstDataIncrement;
+  }
+  if (!mem) {
+    XELOGE(
+        "PlaceConstData: no sub-2GB hole found for the constant table; "
+        "JIT cannot use [disp32] for constants and will not work.");
+    return 0;
+  }
+
+  // The pointer must not be greater than 31 bits.
+  assert_zero(reinterpret_cast<uintptr_t>(mem) & ~0x7FFFFFFF);
+
+  std::memcpy(mem, xmm_consts, sizeof(xmm_consts));
+  /*
+    set each 32-bit element of the constant XMMVRsqrteTableBase to be the
+    address of the start of the constant XMMVRsqrteTableStart this
+  */
+  vec128_t* deferred_constants = reinterpret_cast<vec128_t*>(mem);
+  vec128_t* vrsqrte_table_base = &deferred_constants[XMMVRsqrteTableBase];
+  uint32_t ptr_to_vrsqrte_table32 = static_cast<uint32_t>(
+      reinterpret_cast<uintptr_t>(&deferred_constants[XMMVRsqrteTableStart]));
+  *vrsqrte_table_base = vec128i(ptr_to_vrsqrte_table32);
+
+  memory::Protect(mem, kConstDataSize, memory::PageAccess::kReadOnly, nullptr);
+
+  return reinterpret_cast<uintptr_t>(mem);
+}
+
+void X64Emitter::FreeConstData(uintptr_t data) {
+  memory::DeallocFixed(reinterpret_cast<void*>(data),
+                       xe::round_up(kConstDataSize, memory::page_size()),
+                       memory::DeallocationType::kRelease);
+}
+
+Xbyak::Address X64Emitter::GetXmmConstPtr(XmmConst id) {
+  // Load through fixed constant table setup by PlaceConstData.
+  // It's important that the pointer is not signed, as it will be sign-extended.
+  void* emitter_data_ptr =
+      backend_->LookupXMMConstantAddress(static_cast<unsigned>(id));
+  xenia_assert(reinterpret_cast<uintptr_t>(emitter_data_ptr) <
+               (1ULL << 31));  // must not have signbit set
+  return ptr[emitter_data_ptr];
+}
+// Implies possible StashXmm(0, ...)!
+void X64Emitter::LoadConstantXmm(Xbyak::Xmm dest, const vec128_t& v) {
+  // https://www.agner.org/optimize/optimizing_assembly.pdf
+  // 13.4 Generating constants
+  if (!v.low && !v.high) {
+    // 0000...
+    vpxor(dest, dest);
+  } else if (v.low == ~uint64_t(0) && v.high == ~uint64_t(0)) {
+    // 1111...
+    vpcmpeqb(dest, dest);
+  } else {
+    for (size_t i = 0; i < (kConstDataSize / sizeof(vec128_t)); ++i) {
+      if (xmm_consts[i] == v) {
+        vmovapd(dest, GetXmmConstPtr((XmmConst)i));
+        return;
+      }
+    }
+    if (IsFeatureEnabled(kX64EmitAVX2)) {
+      bool all_equal_bytes = true;
+
+      unsigned firstbyte = v.u8[0];
+      for (unsigned i = 1; i < 16; ++i) {
+        if (v.u8[i] != firstbyte) {
+          all_equal_bytes = false;
+          break;
+        }
+      }
+
+      if (all_equal_bytes) {
+        if (IsFeatureEnabled(kX64EmitGFNI)) {
+          vpxor(dest, dest);
+          vgf2p8affineqb(dest, dest, dest, firstbyte);
+          return;
+        }
+
+        void* bval = FindByteConstantOffset(firstbyte);
+
+        if (bval) {
+          vpbroadcastb(dest, byte[bval]);
+          return;
+        }
+        // didnt find existing mem with the value
+        mov(byte[rsp + kStashOffset], firstbyte);
+        vpbroadcastb(dest, byte[rsp + kStashOffset]);
+        return;
+      }
+
+      bool all_equal_words = true;
+      unsigned firstword = v.u16[0];
+      for (unsigned i = 1; i < 8; ++i) {
+        if (v.u16[i] != firstword) {
+          all_equal_words = false;
+          break;
+        }
+      }
+      if (all_equal_words) {
+        void* wval = FindWordConstantOffset(firstword);
+        if (wval) {
+          vpbroadcastw(dest, word[wval]);
+          return;
+        }
+        // didnt find existing mem with the value
+        mov(word[rsp + kStashOffset], firstword);
+        vpbroadcastw(dest, word[rsp + kStashOffset]);
+        return;
+      }
+
+      bool all_equal_dwords = true;
+      unsigned firstdword = v.u32[0];
+      for (unsigned i = 1; i < 4; ++i) {
+        if (v.u32[i] != firstdword) {
+          all_equal_dwords = false;
+          break;
+        }
+      }
+      if (all_equal_dwords) {
+        void* dwval = FindDwordConstantOffset(firstdword);
+        if (dwval) {
+          vpbroadcastd(dest, dword[dwval]);
+          return;
+        }
+        mov(dword[rsp + kStashOffset], firstdword);
+        vpbroadcastd(dest, dword[rsp + kStashOffset]);
+        return;
+      }
+
+      bool all_equal_qwords = v.low == v.high;
+
+      if (all_equal_qwords) {
+        void* qwval = FindQwordConstantOffset(v.low);
+        if (qwval) {
+          vpbroadcastq(dest, qword[qwval]);
+          return;
+        }
+        MovMem64(rsp + kStashOffset, v.low);
+        vpbroadcastq(dest, qword[rsp + kStashOffset]);
+        return;
+      }
+    }
+
+    for (auto& vec : xmm_consts) {
+      if (vec.low == v.low && vec.high == v.high) {
+        vmovdqa(dest,
+                ptr[reinterpret_cast<void*>(backend_->emitter_data() +
+                                            ((&vec - &xmm_consts[0]) * 16))]);
+        return;
+      }
+    }
+
+    if (v.high == 0 && v.low == ~0ULL) {
+      vpcmpeqb(dest, dest);
+      movq(dest, dest);
+      return;
+    }
+    if (v.high == 0) {
+      if ((v.low & 0xFFFFFFFF) == v.low) {
+        mov(dword[rsp + kStashOffset], static_cast<unsigned>(v.low));
+        movd(dest, dword[rsp + kStashOffset]);
+        return;
+      }
+      MovMem64(rsp + kStashOffset, v.low);
+      movq(dest, qword[rsp + kStashOffset]);
+      return;
+    }
+
+    MovMem64(rsp + kStashOffset, v.low);
+    MovMem64(rsp + kStashOffset + 8, v.high);
+    vmovdqa(dest, ptr[rsp + kStashOffset]);
+  }
+}
+
+void X64Emitter::LoadConstantXmm(Xbyak::Xmm dest, float v) {
+  union {
+    float f;
+    uint32_t i;
+  } x = {v};
+  if (!x.i) {
+    // +0.0f (but not -0.0f because it may be used to flip the sign via xor).
+    vxorps(dest, dest);
+  } else if (x.i == ~uint32_t(0)) {
+    // 1111...
+    vcmpeqss(dest, dest);
+  } else {
+    unsigned raw_bits = *reinterpret_cast<unsigned*>(&v);
+
+    for (size_t i = 0; i < (kConstDataSize / sizeof(vec128_t)); ++i) {
+      if (xmm_consts[i].u32[0] == raw_bits) {
+        vmovss(dest, GetXmmConstPtr((XmmConst)i));
+        return;
+      }
+    }
+    mov(eax, x.i);
+    vmovd(dest, eax);
+  }
+}
+
+void X64Emitter::LoadConstantXmm(Xbyak::Xmm dest, double v) {
+  union {
+    double d;
+    uint64_t i;
+  } x = {v};
+  if (!x.i) {
+    // +0.0 (but not -0.0 because it may be used to flip the sign via xor).
+    vxorpd(dest, dest);
+  } else if (x.i == ~uint64_t(0)) {
+    // 1111...
+    vcmpeqpd(dest, dest);
+  } else {
+    uint64_t raw_bits = *reinterpret_cast<uint64_t*>(&v);
+
+    for (size_t i = 0; i < (kConstDataSize / sizeof(vec128_t)); ++i) {
+      if (xmm_consts[i].u64[0] == raw_bits) {
+        vmovsd(dest, GetXmmConstPtr((XmmConst)i));
+        return;
+      }
+    }
+    mov(rax, x.i);
+    vmovq(dest, rax);
+  }
+}
+
+Xbyak::Address X64Emitter::StashXmm(int index, const Xbyak::Xmm& r) {
+  auto addr = ptr[rsp + kStashOffset + (index * 16)];
+  vmovups(addr, r);
+  return addr;
+}
+
+Xbyak::Address X64Emitter::StashConstantXmm(int index, float v) {
+  union {
+    float f;
+    uint32_t i;
+  } x = {v};
+  auto addr = rsp + kStashOffset + (index * 16);
+  MovMem64(addr, x.i);
+  MovMem64(addr + 8, 0);
+  return ptr[addr];
+}
+
+Xbyak::Address X64Emitter::StashConstantXmm(int index, double v) {
+  union {
+    double d;
+    uint64_t i;
+  } x = {v};
+  auto addr = rsp + kStashOffset + (index * 16);
+  MovMem64(addr, x.i);
+  MovMem64(addr + 8, 0);
+  return ptr[addr];
+}
+
+Xbyak::Address X64Emitter::StashConstantXmm(int index, const vec128_t& v) {
+  auto addr = rsp + kStashOffset + (index * 16);
+  MovMem64(addr, v.low);
+  MovMem64(addr + 8, v.high);
+  return ptr[addr];
+}
+static bool IsVectorCompare(const Instr* i) {
+  hir::Opcode op = i->opcode->num;
+  return op >= hir::OPCODE_VECTOR_COMPARE_EQ &&
+         op <= hir::OPCODE_VECTOR_COMPARE_UGE;
+}
+
+static bool IsFlaggedVectorOp(const Instr* i) {
+  if (IsVectorCompare(i)) {
+    return true;
+  }
+  hir::Opcode op = i->opcode->num;
+  using namespace hir;
+  switch (op) {
+    case OPCODE_VECTOR_SUB:
+    case OPCODE_VECTOR_ADD:
+    case OPCODE_SWIZZLE:
+      return true;
+  }
+  return false;
+}
+
+static SimdDomain GetDomainForFlaggedVectorOp(const hir::Instr* df) {
+  switch (df->flags) {  // check what datatype we compared as
+    case hir::INT16_TYPE:
+    case hir::INT32_TYPE:
+    case hir::INT8_TYPE:
+    case hir::INT64_TYPE:
+      return SimdDomain::INTEGER;
+    case hir::FLOAT32_TYPE:
+    case hir::FLOAT64_TYPE:  // pretty sure float64 doesnt occur with vectors.
+                             // here for completeness
+      return SimdDomain::FLOATING;
+    default:
+      return SimdDomain::DONTCARE;
+  }
+  return SimdDomain::DONTCARE;
+}
+// this list is incomplete
+static bool IsDefiniteIntegerDomainOpcode(hir::Opcode opc) {
+  using namespace hir;
+  switch (opc) {
+    case OPCODE_LOAD_VECTOR_SHL:
+    case OPCODE_LOAD_VECTOR_SHR:
+    case OPCODE_VECTOR_CONVERT_F2I:
+    case OPCODE_VECTOR_MIN:  // there apparently is no FLOAT32_TYPE for min/maxs
+                             // flags
+    case OPCODE_VECTOR_MAX:
+    case OPCODE_VECTOR_SHL:
+    case OPCODE_VECTOR_SHR:
+    case OPCODE_VECTOR_SHA:
+    case OPCODE_VECTOR_ROTATE_LEFT:
+    case OPCODE_VECTOR_AVERAGE:  // apparently no float32 type for this
+    case OPCODE_EXTRACT:
+    case OPCODE_INSERT:  // apparently no f32 type for these two
+      return true;
+  }
+  return false;
+}
+static bool IsDefiniteFloatingDomainOpcode(hir::Opcode opc) {
+  using namespace hir;
+  switch (opc) {
+    case OPCODE_VECTOR_CONVERT_I2F:
+    case OPCODE_VECTOR_DENORMFLUSH:
+    case OPCODE_DOT_PRODUCT_3:
+    case OPCODE_DOT_PRODUCT_4:
+    case OPCODE_LOG2:
+    case OPCODE_POW2:
+    case OPCODE_RECIP:
+    case OPCODE_ROUND:
+    case OPCODE_SQRT:
+    case OPCODE_MUL:
+    case OPCODE_MUL_SUB:
+    case OPCODE_MUL_ADD:
+    case OPCODE_ABS:
+      return true;
+  }
+  return false;
+}
+
+SimdDomain X64Emitter::DeduceSimdDomain(const hir::Value* for_value) {
+  hir::Instr* df = for_value->def;
+  if (!df) {
+    // todo: visit uses to figure out domain
+    return SimdDomain::DONTCARE;
+
+  } else {
+    SimdDomain result = SimdDomain::DONTCARE;
+
+    if (IsFlaggedVectorOp(df)) {
+      result = GetDomainForFlaggedVectorOp(df);
+    } else if (IsDefiniteIntegerDomainOpcode(df->opcode->num)) {
+      result = SimdDomain::INTEGER;
+    } else if (IsDefiniteFloatingDomainOpcode(df->opcode->num)) {
+      result = SimdDomain::FLOATING;
+    }
+
+    // todo: check if still dontcare, if so, visit uses of the value to figure
+    // it out
+    return result;
+  }
+
+  return SimdDomain::DONTCARE;
+}
+Xbyak::Address X64Emitter::GetBackendCtxPtr(int offset_in_x64backendctx) const {
+  /*
+    index context ptr negatively to get to backend ctx field
+  */
+  ptrdiff_t delta = (-static_cast<ptrdiff_t>(sizeof(X64BackendContext))) +
+                    offset_in_x64backendctx;
+  return ptr[GetContextReg() + static_cast<int>(delta)];
+}
+Xbyak::Label& X64Emitter::AddToTail(TailEmitCallback callback,
+                                    uint32_t alignment) {
+  TailEmitter emitter{};
+  emitter.func = std::move(callback);
+  emitter.alignment = alignment;
+  tail_code_.push_back(std::move(emitter));
+  return tail_code_.back().label;
+}
+Xbyak::Label& X64Emitter::NewCachedLabel() {
+  Xbyak::Label* tmp = new Xbyak::Label;
+  label_cache_.push_back(tmp);
+  return *tmp;
+}
+
+void X64Emitter::EmitPreemptCheck(uint32_t guest_address) {
+  // Only safe at a block head, where the per-block register allocator leaves no
+  // guest value live and ForgetMxcsrMode has already run, so the unannounced
+  // guest->host call cannot lose a register or desync the mode tracking.
+  //
+  // Tests the preempt flag other threads raise. The cold path clears it, a
+  // deferred yield re-sets it.
+  Xbyak::Label& after = NewCachedLabel();
+  Xbyak::Label& restore = NewCachedLabel();
+  if (cvars::log_safepoint_pc && guest_address) {
+    // Diagnostic only: one store on every loop back-edge, so it stays off
+    // unless a wedge is being chased. Immediate-to-memory needs no scratch
+    // register and leaves the flags the cmp below sets untouched.
+    mov(dword[GetContextReg() + offsetof(ppc::PPCContext, last_safepoint_pc)],
+        guest_address);
+  }
+  cmp(byte[GetContextReg() + offsetof(ppc::PPCContext, preempt_requested)], 0);
+  Xbyak::Label& do_yield =
+      AddToTail([&restore, &after](X64Emitter& e, Xbyak::Label& tail) {
+        e.L(tail);
+        e.mov(e.byte[e.GetContextReg() +
+                     offsetof(ppc::PPCContext, preempt_requested)],
+              0);
+        // Saved into the frame rather than pushed, since the unwind info
+        // registered for this function describes a fixed rsp.
+        e.mov(e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 0], e.rax);
+        e.mov(e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 8], e.rcx);
+        e.mov(e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 16], e.rdx);
+        // Null until the scheduler starts, and a stale flag can reach here
+        // after it shuts down, so check before calling.
+        e.mov(e.rax, reinterpret_cast<uint64_t>(
+                         &xe::cpu::backend::preempt_yield_handler));
+        e.mov(e.rcx, e.qword[e.rax]);
+        e.test(e.rcx, e.rcx);
+        e.jz(restore, X64Emitter::T_NEAR);
+        e.call(e.backend()->guest_to_host_thunk());
+        e.L(restore);
+        e.mov(e.rax, e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 0]);
+        e.mov(e.rcx, e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 8]);
+        e.mov(e.rdx, e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 16]);
+        e.jmp(after, X64Emitter::T_NEAR);
+      });
+  jnz(do_yield, T_NEAR);
+  L(after);
+}
+
+static void LoadMxcsrDirectForMode(X64Emitter& e, MXCSRMode mode) {
+  if (mode == MXCSRMode::Fpu) {
+    e.LoadFpuMxcsrDirect();
+  } else if (mode == MXCSRMode::Vmx) {
+    e.LoadVmxMxcsrDirect();
+  } else if (mode == MXCSRMode::VmxDaz) {
+    e.LoadVmxDazMxcsrDirect();
+  } else {
+    assert_unhandled_case(mode);
+  }
+}
+
+static bool IsVmxMode(MXCSRMode mode) {
+  return mode == MXCSRMode::Vmx || mode == MXCSRMode::VmxDaz;
+}
+
+// Record which of the three mxcsr values is live. The daz bit only means
+// anything while the mode bit says vmx, and only while NJM is off.
+static void SetMxcsrModeFlags(X64Emitter& e, MXCSRMode mode) {
+  auto flags = e.GetBackendFlagsPtr();
+  if (mode == MXCSRMode::Fpu) {
+    e.btr(flags, kX64BackendMXCSRModeBit);
+  } else {
+    e.bts(flags, kX64BackendMXCSRModeBit);
+    if (mode == MXCSRMode::VmxDaz) {
+      e.bts(flags, kX64BackendMXCSRDazBit);
+    } else {
+      e.btr(flags, kX64BackendMXCSRDazBit);
+    }
+  }
+}
+
+// SET_NJM only ever writes mxcsr_vmx one of two values, and the NJM on value is
+// the one mxcsr_vmx_daz always holds. So while NJM is on the two vmx mxcsrs are
+// the same bits and switching between them is nothing at all. Switching with
+// the mode statically known then costs a test and a fallthrough, not a
+// vldmxcsr.
+static void ChangeVmxVariantWithNjmGate(X64Emitter& e, MXCSRMode new_mode) {
+  Xbyak::Label& come_back = e.NewCachedLabel();
+  Xbyak::Label& reload = e.AddToTail(
+      [&come_back, new_mode](X64Emitter& e, Xbyak::Label& thislabel) {
+        e.L(thislabel);
+        LoadMxcsrDirectForMode(e, new_mode);
+        SetMxcsrModeFlags(e, new_mode);
+        e.jmp(come_back, X64Emitter::T_NEAR);
+      });
+  e.bt(e.GetBackendFlagsPtr(), kX64BackendNJMOn);
+  e.jnc(reload, X64Emitter::T_NEAR);
+  e.L(come_back);
+}
+
+static void ChangeMxcsrModeDynamicHelper(X64Emitter& e, MXCSRMode new_mode) {
+  auto flags = e.GetBackendFlagsPtr();
+  Xbyak::Label& come_back = e.NewCachedLabel();
+
+  Xbyak::Label& reload_bailout = e.AddToTail(
+      [&come_back, new_mode](X64Emitter& e, Xbyak::Label& thislabel) {
+        e.L(thislabel);
+        LoadMxcsrDirectForMode(e, new_mode);
+        // Reached by any test below, so normalize both bits here.
+        SetMxcsrModeFlags(e, new_mode);
+        e.jmp(come_back, X64Emitter::T_NEAR);
+      });
+
+  // Each bt both records the bit we want and reports what it was, so a
+  // mismatch on either one falls out to the reload.
+  if (new_mode == MXCSRMode::Fpu) {
+    e.btr(flags, kX64BackendMXCSRModeBit);
+    e.jc(reload_bailout, X64Emitter::T_NEAR);  // was one of the vmx mxcsrs
+  } else {
+    e.bts(flags, kX64BackendMXCSRModeBit);
+    e.jnc(reload_bailout, X64Emitter::T_NEAR);  // was the fpu mxcsr
+    // Some vmx mxcsr is live and with NJM on both are the same bits, so it
+    // already serves whichever of the two we were asked for.
+    e.bt(flags, kX64BackendNJMOn);
+    e.jc(come_back, X64Emitter::T_NEAR);
+    if (new_mode == MXCSRMode::VmxDaz) {
+      e.bts(flags, kX64BackendMXCSRDazBit);
+      e.jnc(reload_bailout, X64Emitter::T_NEAR);  // was plain vmx
+    } else {
+      e.btr(flags, kX64BackendMXCSRDazBit);
+      e.jc(reload_bailout, X64Emitter::T_NEAR);  // was daz vmx
+    }
+  }
+  e.L(come_back);
+}
+
+bool X64Emitter::ChangeMxcsrMode(MXCSRMode new_mode, bool already_set) {
+  if (cvars::enable_incorrect_roundingmode_behavior) {
+    return false;  // no MXCSR mode handling!
+  }
+  if (new_mode == mxcsr_mode_) {
+    return false;
+  }
+  assert_true(new_mode != MXCSRMode::Unknown);
+
+  if (mxcsr_mode_ == MXCSRMode::Unknown) {
+    // check the mode dynamically
+    mxcsr_mode_ = new_mode;
+    if (!already_set) {
+      ChangeMxcsrModeDynamicHelper(*this, new_mode);
+    } else {  // even if already set, we still need to update flags to reflect
+              // our mode
+      SetMxcsrModeFlags(*this, new_mode);
+    }
+  } else {
+    MXCSRMode old_mode = mxcsr_mode_;
+    mxcsr_mode_ = new_mode;
+    if (!already_set) {
+      if (IsVmxMode(old_mode) && IsVmxMode(new_mode)) {
+        ChangeVmxVariantWithNjmGate(*this, new_mode);
+      } else {
+        LoadMxcsrDirectForMode(*this, new_mode);
+        SetMxcsrModeFlags(*this, new_mode);
+      }
+      return true;
+    } else {
+      // The flags word must describe the new mode even on the already_set path.
+      SetMxcsrModeFlags(*this, new_mode);
+    }
+  }
+  return false;
+}
+void X64Emitter::LoadFpuMxcsrDirect() {
+  vldmxcsr(GetBackendCtxPtr(offsetof(X64BackendContext, mxcsr_fpu)));
+}
+void X64Emitter::LoadVmxMxcsrDirect() {
+  vldmxcsr(GetBackendCtxPtr(offsetof(X64BackendContext, mxcsr_vmx)));
+}
+void X64Emitter::LoadVmxDazMxcsrDirect() {
+  vldmxcsr(GetBackendCtxPtr(offsetof(X64BackendContext, mxcsr_vmx_daz)));
+}
+Xbyak::Address X64Emitter::GetBackendFlagsPtr() const {
+  Xbyak::Address pt = GetBackendCtxPtr(offsetof(X64BackendContext, flags));
+  pt.setBit(32);
+  return pt;
+}
+
+void X64Emitter::HandleStackpointOverflowError(ppc::PPCContext* context) {
+  if (debugging::IsDebuggerAttached()) {
+    debugging::Break();
+  }
+  // context->lr
+  // todo: show lr in message?
+  xe::FatalError(
+      "Overflowed stackpoints! Please report this error for this title to "
+      "Xenia developers.");
+}
+
+void X64Emitter::PushStackpoint() {
+  if (!cvars::enable_host_guest_stack_synchronization ||
+      !function_has_stackpoint_) {
+    return;
+  }
+  // push the current host and guest stack pointers
+  // this runs once the frame is allocated and before any guest instructions
+  // execute, and is probably the most intrusive part of the stackpoint
+  //
+  // Scratch regs here must NOT be in gpr_reg_map_ — the callee's prolog
+  // runs them before the caller's live HIR values would be spilled, so
+  // clobbering an allocatable reg corrupts state across the call.
+  mov(rdx, GetBackendCtxPtr(offsetof(X64BackendContext, stackpoints)));
+  mov(eax,
+      GetBackendCtxPtr(offsetof(X64BackendContext, current_stackpoint_depth)));
+
+  mov(r8, qword[GetContextReg() + offsetof(ppc::PPCContext, r[1])]);
+
+  imul(r9d, eax, sizeof(X64BackendStackpoint));
+  add(rdx, r9);
+
+  mov(qword[rdx + offsetof(X64BackendStackpoint, host_stack_)], rsp);
+  mov(dword[rdx + offsetof(X64BackendStackpoint, guest_stack_)], r8d);
+  mov(r8d, dword[GetContextReg() + offsetof(ppc::PPCContext, lr)]);
+  mov(dword[rdx + offsetof(X64BackendStackpoint, guest_return_address_)], r8d);
+
+  if (IsFeatureEnabled(kX64FlagsIndependentVars)) {
+    inc(eax);
+  } else {
+    add(eax, 1);
+  }
+
+  mov(GetBackendCtxPtr(offsetof(X64BackendContext, current_stackpoint_depth)),
+      eax);
+
+  cmp(eax, (uint32_t)cvars::max_stackpoints);
+
+  Xbyak::Label& overflowed_stackpoints =
+      AddToTail([](X64Emitter& e, Xbyak::Label& our_tail_label) {
+        e.L(our_tail_label);
+        e.CallNativeSafe((void*)X64Emitter::HandleStackpointOverflowError);
+      });
+  jge(overflowed_stackpoints, T_NEAR);
+}
+void X64Emitter::EmitDropCallingFrame() {
+  // A blr to somewhere other than this frame's return address, such as a
+  // dispatcher jumping to the next translated block, returns into neither this
+  // frame nor its caller. The target takes the caller's frame as if the caller
+  // had tail-called it, which keeps the host stack from growing by a frame per
+  // jump.
+  Xbyak::Label keep_frame;
+  // Only a function's entry can take a frame.
+  Xbyak::Address in_body =
+      GetBackendCtxPtr(offsetof(X64BackendContext, dynamic_target_in_body));
+  in_body.setBit(32);
+  cmp(in_body, 0);
+  jne(keep_frame, T_NEAR);
+  mov(ecx,
+      GetBackendCtxPtr(offsetof(X64BackendContext, current_stackpoint_depth)));
+  // This frame, its caller, and the frame the caller returns into.
+  cmp(ecx, 3);
+  jb(keep_frame, T_NEAR);
+  static_assert(sizeof(X64BackendStackpoint) == 16);
+  sub(ecx, 2);
+  shl(ecx, 4);
+  mov(r9, GetBackendCtxPtr(offsetof(X64BackendContext, stackpoints)));
+  add(r9, rcx);
+  // The caller's own stack pointer is just above this frame's return address.
+  lea(rcx, ptr[rsp + static_cast<uint32_t>(stack_size() + 8)]);
+  cmp(rcx, qword[r9 + offsetof(X64BackendStackpoint, host_stack_)]);
+  jne(keep_frame, T_NEAR);
+  static_assert(offsetof(X64BackendStackpoint, host_stack_) == 0);
+  mov(r8, qword[r9 - static_cast<int>(sizeof(X64BackendStackpoint))]);
+  cmp(r8, rcx);
+  jbe(keep_frame, T_NEAR);
+  // A caller entered from host code returns into host code.
+  cmp(dword[rcx + StackLayout::GUEST_RET_ADDR], kHostReturnAddress);
+  je(keep_frame, T_NEAR);
+  EmitTraceUserCallReturn();
+  EmitProfilerEpilogue();
+  // Pass the caller's return address over and return where it would.
+  mov(rcx, qword[r9 + offsetof(X64BackendStackpoint, host_stack_)]);
+  mov(rcx, qword[rcx + StackLayout::GUEST_RET_ADDR]);
+  lea(rsp, ptr[r8 - 8]);
+  Xbyak::Address depth =
+      GetBackendCtxPtr(offsetof(X64BackendContext, current_stackpoint_depth));
+  depth.setBit(32);
+  sub(depth, 2);
+  jmp(rax);
+  L(keep_frame);
+}
+
+void X64Emitter::PopStackpoint() {
+  if (!cvars::enable_host_guest_stack_synchronization ||
+      !function_has_stackpoint_) {
+    return;
+  }
+  // todo: maybe verify that rsp and r1 == the stackpoint?
+  Xbyak::Address stackpoint_pos_pointer =
+      GetBackendCtxPtr(offsetof(X64BackendContext, current_stackpoint_depth));
+  stackpoint_pos_pointer.setBit(32);
+  dec(stackpoint_pos_pointer);
+}
+
+void X64Emitter::EnsureSynchronizedGuestAndHostStack() {
+  if (!cvars::enable_host_guest_stack_synchronization) {
+    return;
+  }
+  // chrispy: keeping this old slower test here in case in the future changes
+  // need to be made
+  // that result in the stack not being 8 byte misaligned on context reentry
+
+  Xbyak::Label& return_from_sync = this->NewCachedLabel();
+
+  // if we got here somehow from setjmp or the like we ought to have a
+  // misaligned stack right now! this provides us with a very fast pretest for
+  // this condition
+  test(esp, 15);
+
+  Xbyak::Label& sync_label = this->AddToTail(
+      [&return_from_sync](X64Emitter& e, Xbyak::Label& our_tail_label) {
+        e.L(our_tail_label);
+        e.call(e.backend()->synchronize_guest_and_host_stack_helper());
+        e.jmp(return_from_sync, T_NEAR);
+      });
+
+  jnz(sync_label, T_NEAR);
+
+  L(return_from_sync);
+}
+}  // namespace x64
+}  // namespace backend
+}  // namespace cpu
+}  // namespace xe

@@ -1,0 +1,4436 @@
+﻿/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+// A note about vectors:
+// Xenia represents vectors as xyzw pairs, with indices 0123.
+// XMM registers are xyzw pairs with indices 3210, making them more like wzyx.
+// This makes things somewhat confusing. It'd be nice to just shuffle the
+// registers around on load/store, however certain operations require that
+// data be in the right offset.
+// Basically, this identity must hold:
+//   shuffle(vec, b00011011) -> {x,y,z,w} => {x,y,z,w}
+// All indices and operations must respect that.
+//
+// Memory (big endian):
+// [00 01 02 03] [04 05 06 07] [08 09 0A 0B] [0C 0D 0E 0F] (x, y, z, w)
+// load into xmm register:
+// [0F 0E 0D 0C] [0B 0A 09 08] [07 06 05 04] [03 02 01 00] (w, z, y, x)
+
+#include "xenia/cpu/backend/x64/x64_sequences.h"
+
+#include <cstdio>
+#include <cstring>
+
+#include "xenia/base/assert.h"
+#include "xenia/base/clock.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/threading.h"
+#include "xenia/cpu/backend/x64/x64_emitter.h"
+#include "xenia/cpu/backend/x64/x64_op.h"
+#include "xenia/cpu/backend/x64/x64_tracers.h"
+// Needed for MXCSR scratch storage.
+#include "xenia/cpu/backend/x64/x64_stack_layout.h"
+#include "xenia/cpu/backend/x64/x64_util.h"
+#include "xenia/cpu/cpu_flags.h"
+#include "xenia/cpu/hir/hir_builder.h"
+#include "xenia/cpu/ppc/ppc_estimates.h"
+#include "xenia/cpu/processor.h"
+
+DEFINE_bool(use_fast_dot_product, true,
+            "Compute vmsum3fp128 and vmsum4fp128 as a float64 sum truncated to "
+            "single, about three times faster but differing from the console "
+            "in about 3% of results.",
+            "CPU");
+UPDATE_from_bool(use_fast_dot_product, 2026, 11, 19, 8, false);
+
+DEFINE_bool(inline_loadclock, false,
+            "Directly read cached guest clock without calling the LoadClock "
+            "method (it gets repeatedly updated by calls from other threads)",
+            "CPU");
+DEFINE_bool(delay_via_maybeyield, false,
+            "implement the db16cyc instruction via MaybeYield, may improve "
+            "scheduling of guest threads",
+            "x64");
+namespace xe {
+namespace cpu {
+namespace backend {
+namespace x64 {
+
+using namespace Xbyak;
+
+// TODO(benvanik): direct usings.
+using namespace xe::cpu;
+using namespace xe::cpu::hir;
+
+using xe::cpu::hir::Instr;
+
+// The multiply-add family and the dot products flush denormals whatever NJM
+// says. Pinning that on needs an MXCSR of its own, which costs a mode switch
+// wherever they interleave with the rest of VMX, so it is opt in. Without it
+// they follow NJM like every other VMX op, which only differs once a title
+// clears VSCR.NJ.
+static MXCSRMode VmxDenormalFlushMode() {
+  return cvars::accurate_vmx_denormal_flush ? MXCSRMode::VmxDaz
+                                            : MXCSRMode::Vmx;
+}
+
+typedef bool (*SequenceSelectFn)(X64Emitter&, const Instr*, InstrKeyValue ikey);
+std::unordered_map<uint32_t, SequenceSelectFn>& SequenceTable() {
+  static auto* table = new std::unordered_map<uint32_t, SequenceSelectFn>();
+  return *table;
+}
+
+// ============================================================================
+// OPCODE_COMMENT
+// ============================================================================
+struct COMMENT : Sequence<COMMENT, I<OPCODE_COMMENT, VoidOp, OffsetOp>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (IsTracingInstr()) {
+      auto str = reinterpret_cast<const char*>(i.src1.value);
+      // TODO(benvanik): pass through.
+      // TODO(benvanik): don't just leak this memory.
+      auto str_copy = strdup(str);
+      e.mov(e.rdx, reinterpret_cast<uint64_t>(str_copy));
+      e.CallNative(reinterpret_cast<void*>(TraceString));
+    }
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_COMMENT, COMMENT);
+
+// ============================================================================
+// OPCODE_NOP
+// ============================================================================
+struct NOP : Sequence<NOP, I<OPCODE_NOP, VoidOp>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) { e.nop(); }
+};
+EMITTER_OPCODE_TABLE(OPCODE_NOP, NOP);
+
+// ============================================================================
+// OPCODE_SOURCE_OFFSET
+// ============================================================================
+struct SOURCE_OFFSET
+    : Sequence<SOURCE_OFFSET, I<OPCODE_SOURCE_OFFSET, VoidOp, OffsetOp>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.MarkSourceOffset(i.instr);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_SOURCE_OFFSET, SOURCE_OFFSET);
+
+// ============================================================================
+// OPCODE_ASSIGN
+// ============================================================================
+struct ASSIGN_I8 : Sequence<ASSIGN_I8, I<OPCODE_ASSIGN, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.mov(i.dest, i.src1);
+  }
+};
+struct ASSIGN_I16 : Sequence<ASSIGN_I16, I<OPCODE_ASSIGN, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.mov(i.dest, i.src1);
+  }
+};
+struct ASSIGN_I32 : Sequence<ASSIGN_I32, I<OPCODE_ASSIGN, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.mov(i.dest, i.src1);
+  }
+};
+struct ASSIGN_I64 : Sequence<ASSIGN_I64, I<OPCODE_ASSIGN, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.mov(i.dest, i.src1);
+  }
+};
+struct ASSIGN_F32 : Sequence<ASSIGN_F32, I<OPCODE_ASSIGN, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.vmovaps(i.dest, i.src1);
+  }
+};
+struct ASSIGN_F64 : Sequence<ASSIGN_F64, I<OPCODE_ASSIGN, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.vmovaps(i.dest, i.src1);
+  }
+};
+struct ASSIGN_V128 : Sequence<ASSIGN_V128, I<OPCODE_ASSIGN, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    SimdDomain domain = e.DeduceSimdDomain(i.src1.value);
+    if (domain == SimdDomain::INTEGER) {
+      e.vmovdqa(i.dest, i.src1);
+    } else {
+      e.vmovaps(i.dest, i.src1);
+    }
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_ASSIGN, ASSIGN_I8, ASSIGN_I16, ASSIGN_I32,
+                     ASSIGN_I64, ASSIGN_F32, ASSIGN_F64, ASSIGN_V128);
+
+// ============================================================================
+// OPCODE_CAST
+// ============================================================================
+struct CAST_I32_F32 : Sequence<CAST_I32_F32, I<OPCODE_CAST, I32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.vmovd(i.dest, i.src1);
+  }
+};
+struct CAST_I64_F64 : Sequence<CAST_I64_F64, I<OPCODE_CAST, I64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.vmovq(i.dest, i.src1);
+  }
+};
+struct CAST_F32_I32 : Sequence<CAST_F32_I32, I<OPCODE_CAST, F32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.vmovd(i.dest, i.src1);
+  }
+};
+struct CAST_F64_I64 : Sequence<CAST_F64_I64, I<OPCODE_CAST, F64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.vmovq(i.dest, i.src1);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_CAST, CAST_I32_F32, CAST_I64_F64, CAST_F32_I32,
+                     CAST_F64_I64);
+
+// ============================================================================
+// OPCODE_ZERO_EXTEND
+// ============================================================================
+struct ZERO_EXTEND_I16_I8
+    : Sequence<ZERO_EXTEND_I16_I8, I<OPCODE_ZERO_EXTEND, I16Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.movzx(i.dest, i.src1);
+  }
+};
+struct ZERO_EXTEND_I32_I8
+    : Sequence<ZERO_EXTEND_I32_I8, I<OPCODE_ZERO_EXTEND, I32Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.movzx(i.dest, i.src1);
+  }
+};
+struct ZERO_EXTEND_I64_I8
+    : Sequence<ZERO_EXTEND_I64_I8, I<OPCODE_ZERO_EXTEND, I64Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.movzx(i.dest.reg().cvt32(), i.src1);
+  }
+};
+struct ZERO_EXTEND_I32_I16
+    : Sequence<ZERO_EXTEND_I32_I16, I<OPCODE_ZERO_EXTEND, I32Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.movzx(i.dest, i.src1);
+  }
+};
+struct ZERO_EXTEND_I64_I16
+    : Sequence<ZERO_EXTEND_I64_I16, I<OPCODE_ZERO_EXTEND, I64Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.movzx(i.dest.reg().cvt32(), i.src1);
+  }
+};
+struct ZERO_EXTEND_I64_I32
+    : Sequence<ZERO_EXTEND_I64_I32, I<OPCODE_ZERO_EXTEND, I64Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.mov(i.dest.reg().cvt32(), i.src1);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_ZERO_EXTEND, ZERO_EXTEND_I16_I8, ZERO_EXTEND_I32_I8,
+                     ZERO_EXTEND_I64_I8, ZERO_EXTEND_I32_I16,
+                     ZERO_EXTEND_I64_I16, ZERO_EXTEND_I64_I32);
+
+// ============================================================================
+// OPCODE_SIGN_EXTEND
+// ============================================================================
+struct SIGN_EXTEND_I16_I8
+    : Sequence<SIGN_EXTEND_I16_I8, I<OPCODE_SIGN_EXTEND, I16Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.movsx(i.dest, i.src1);
+  }
+};
+struct SIGN_EXTEND_I32_I8
+    : Sequence<SIGN_EXTEND_I32_I8, I<OPCODE_SIGN_EXTEND, I32Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.movsx(i.dest, i.src1);
+  }
+};
+struct SIGN_EXTEND_I64_I8
+    : Sequence<SIGN_EXTEND_I64_I8, I<OPCODE_SIGN_EXTEND, I64Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.movsx(i.dest, i.src1);
+  }
+};
+struct SIGN_EXTEND_I32_I16
+    : Sequence<SIGN_EXTEND_I32_I16, I<OPCODE_SIGN_EXTEND, I32Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.movsx(i.dest, i.src1);
+  }
+};
+struct SIGN_EXTEND_I64_I16
+    : Sequence<SIGN_EXTEND_I64_I16, I<OPCODE_SIGN_EXTEND, I64Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.movsx(i.dest, i.src1);
+  }
+};
+struct SIGN_EXTEND_I64_I32
+    : Sequence<SIGN_EXTEND_I64_I32, I<OPCODE_SIGN_EXTEND, I64Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.movsxd(i.dest, i.src1);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_SIGN_EXTEND, SIGN_EXTEND_I16_I8, SIGN_EXTEND_I32_I8,
+                     SIGN_EXTEND_I64_I8, SIGN_EXTEND_I32_I16,
+                     SIGN_EXTEND_I64_I16, SIGN_EXTEND_I64_I32);
+
+// ============================================================================
+// OPCODE_TRUNCATE
+// ============================================================================
+struct TRUNCATE_I8_I16
+    : Sequence<TRUNCATE_I8_I16, I<OPCODE_TRUNCATE, I8Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.movzx(i.dest.reg().cvt32(), i.src1.reg().cvt8());
+  }
+};
+struct TRUNCATE_I8_I32
+    : Sequence<TRUNCATE_I8_I32, I<OPCODE_TRUNCATE, I8Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.movzx(i.dest.reg().cvt32(), i.src1.reg().cvt8());
+  }
+};
+struct TRUNCATE_I8_I64
+    : Sequence<TRUNCATE_I8_I64, I<OPCODE_TRUNCATE, I8Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.movzx(i.dest.reg().cvt32(), i.src1.reg().cvt8());
+  }
+};
+struct TRUNCATE_I16_I32
+    : Sequence<TRUNCATE_I16_I32, I<OPCODE_TRUNCATE, I16Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.movzx(i.dest.reg().cvt32(), i.src1.reg().cvt16());
+  }
+};
+struct TRUNCATE_I16_I64
+    : Sequence<TRUNCATE_I16_I64, I<OPCODE_TRUNCATE, I16Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.movzx(i.dest.reg().cvt32(), i.src1.reg().cvt16());
+  }
+};
+struct TRUNCATE_I32_I64
+    : Sequence<TRUNCATE_I32_I64, I<OPCODE_TRUNCATE, I32Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.mov(i.dest, i.src1.reg().cvt32());
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_TRUNCATE, TRUNCATE_I8_I16, TRUNCATE_I8_I32,
+                     TRUNCATE_I8_I64, TRUNCATE_I16_I32, TRUNCATE_I16_I64,
+                     TRUNCATE_I32_I64);
+
+// ============================================================================
+// OPCODE_CONVERT
+// ============================================================================
+struct CONVERT_I32_F32
+    : Sequence<CONVERT_I32_F32, I<OPCODE_CONVERT, I32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    // TODO(benvanik): saturation check? cvtt* (trunc?)
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    if (i.instr->flags == ROUND_TO_ZERO) {
+      e.vcvttss2si(i.dest, src1);
+    } else {
+      e.vcvtss2si(i.dest, src1);
+    }
+  }
+};
+struct CONVERT_I32_F64
+    : Sequence<CONVERT_I32_F64, I<OPCODE_CONVERT, I32Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    // Intel returns 0x80000000 if the double value does not fit within an int32
+    // PPC saturates the value instead.
+    // So, we can clamp the double value to (double)0x7FFFFFFF. vminsd returns
+    // its second operand when either is a NaN, so a NaN stays one and gives
+    // 0x80000000, as PPC does.
+    e.vmovsd(e.xmm1, e.GetXmmConstPtr(XMMIntMaxPD));
+    e.vminsd(e.xmm1, e.xmm1, GetInputRegOrConstant(e, i.src1, e.xmm0));
+    if (i.instr->flags == ROUND_TO_ZERO) {
+      e.vcvttsd2si(i.dest, e.xmm1);
+    } else {
+      e.vcvtsd2si(i.dest, e.xmm1);
+    }
+  }
+};
+struct CONVERT_I64_F64
+    : Sequence<CONVERT_I64_F64, I<OPCODE_CONVERT, I64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+
+    if (i.instr->flags == ROUND_TO_ZERO) {
+      e.vcvttsd2si(i.dest, src1);
+    } else {
+      e.vcvtsd2si(i.dest, src1);
+    }
+
+    // 0x8000000000000000
+    e.mov(e.rax, 0x1);
+    e.shl(e.rax, 63);
+
+    // Saturate positive overflow. A NaN compares unordered, so it keeps
+    // 0x8000000000000000, as PPC gives.
+    // if (result ind. && src1 >= 0)
+    //   result = 0x7FFFFFFFFFFFFFFF;
+    e.cmp(e.rax, i.dest);
+    e.sete(e.al);
+    e.vucomisd(src1, e.GetXmmConstPtr(XMMZero));
+    e.setae(e.cl);
+    e.and_(e.al, e.cl);
+    e.movzx(e.rax, e.al);
+
+    e.sub(i.dest, e.rax);
+  }
+};
+struct CONVERT_F32_I32
+    : Sequence<CONVERT_F32_I32, I<OPCODE_CONVERT, F32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(CONVERT_F32_I32);
+  }
+};
+struct CONVERT_F32_F64
+    : Sequence<CONVERT_F32_F64, I<OPCODE_CONVERT, F32Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    Xbyak::Xmm src = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    e.vcvtsd2ss(i.dest, src, src);
+  }
+};
+struct CONVERT_F64_I64
+    : Sequence<CONVERT_F64_I64, I<OPCODE_CONVERT, F64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+
+    Reg64 input = i.src1;
+    if (i.src1.is_constant) {
+      input = e.rax;
+      e.mov(input, (uintptr_t)i.src1.constant());
+    }
+
+    // A zeroed merge source keeps dest's old value out of the dependency chain.
+    e.vxorpd(e.xmm0, e.xmm0, e.xmm0);
+    e.vcvtsi2sd(i.dest, e.xmm0, input);
+  }
+};
+struct CONVERT_F64_F32
+    : Sequence<CONVERT_F64_F32, I<OPCODE_CONVERT, F64Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    Xbyak::Xmm src = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    e.vcvtss2sd(i.dest, src, src);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_CONVERT, CONVERT_I32_F32, CONVERT_I32_F64,
+                     CONVERT_I64_F64, CONVERT_F32_I32, CONVERT_F32_F64,
+                     CONVERT_F64_I64, CONVERT_F64_F32);
+
+struct TOSINGLE_F64_F64
+    : Sequence<TOSINGLE_F64_F64, I<OPCODE_TO_SINGLE, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+
+    Xmm srcreg = GetInputRegOrConstant(e, i.src1, e.xmm1);
+
+    if (cvars::no_round_to_single) {
+      if (i.dest != i.src1 || i.src1.is_constant) {
+        e.vmovapd(i.dest, srcreg);
+      }
+
+    } else {
+      /*
+         i compared the results for this cvtss/cvtsd to results generated
+         on actual hardware, it looks good to me
+      */
+      e.vcvtsd2ss(e.xmm0, srcreg, srcreg);
+      // Fused, the operation before kept every NaN away from here. A source
+      // that is never a wide NaN rounds without losing a payload bit.
+      assert_true(!e.fused_to_single() || e.fused_to_single() == i.instr);
+      Xbyak::Label* past_nan = e.ConsumeFusedToSingle(i.instr);
+      if (!(i.instr->flags & TO_SINGLE_KEEP_NAN) || past_nan ||
+          i.src1.value->IsNeverWideNan()) {
+        e.vcvtss2sd(i.dest, e.xmm0, e.xmm0);
+        if (past_nan) {
+          e.L(*past_nan);
+        }
+        return;
+      }
+      // A NaN takes the tail, which returns it quieted with its whole
+      // payload. The source is still intact there when dest aliases it.
+      Xbyak::Label& done = e.NewCachedLabel();
+      Xbyak::Label& keep_nan =
+          e.AddToTail([i, srcreg, &done](X64Emitter& e, Xbyak::Label& tail) {
+            e.L(tail);
+            e.vmovq(e.rax, srcreg);
+            e.bts(e.rax, 51);
+            e.vmovq(i.dest, e.rax);
+            e.jmp(done, e.T_NEAR);
+          });
+      e.vucomisd(srcreg, srcreg);
+      e.jp(keep_nan, e.T_NEAR);
+      e.vcvtss2sd(i.dest, e.xmm0, e.xmm0);
+      e.L(done);
+    }
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_TO_SINGLE, TOSINGLE_F64_F64);
+
+// ============================================================================
+// OPCODE_UNPACK_SINGLE
+// ============================================================================
+// lfs widens without quieting, so only a signaling NaN needs the quiet bit the
+// host convert set cleared again.
+struct UNPACK_SINGLE
+    : Sequence<UNPACK_SINGLE, I<OPCODE_UNPACK_SINGLE, F64Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    if (i.src1.is_constant) {
+      e.mov(e.eax, i.src1.constant());
+    } else {
+      e.mov(e.eax, i.src1);
+    }
+    e.vmovd(e.xmm0, e.eax);
+    e.vcvtss2sd(i.dest, e.xmm0, e.xmm0);
+
+    Xbyak::Label done;
+    // An all-ones exponent is a NaN or an infinity; an infinity's bit 51 is
+    // already clear.
+    e.mov(e.edx, e.eax);
+    e.and_(e.edx, 0x7FFFFFFFu);
+    e.cmp(e.edx, 0x7F800000u);
+    e.jb(done);
+    // A quiet NaN already has the bit the convert set.
+    e.test(e.eax, 1u << 22);
+    e.jnz(done);
+    e.vmovq(e.rdx, i.dest);
+    e.btr(e.rdx, 51);
+    e.vmovq(i.dest, e.rdx);
+    e.L(done);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_UNPACK_SINGLE, UNPACK_SINGLE);
+
+// ============================================================================
+// OPCODE_PACK_SINGLE
+// ============================================================================
+// stfs narrows without quieting: a NaN gets the double's quiet bit back.
+struct PACK_SINGLE
+    : Sequence<PACK_SINGLE, I<OPCODE_PACK_SINGLE, I32Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    Xbyak::Xmm src = GetInputRegOrConstant(e, i.src1, e.xmm1);
+    e.vcvtsd2ss(e.xmm0, src, src);
+    e.vmovd(i.dest, e.xmm0);
+
+    Xbyak::Label done;
+    e.vmovq(e.rax, src);
+    e.mov(e.rdx, e.rax);
+    // AND r64 only takes a sign-extended imm32, so clear the sign with BTR.
+    e.btr(e.rdx, 63);
+    e.mov(e.rcx, 0x7FF0000000000000ull);
+    e.cmp(e.rdx, e.rcx);
+    e.jbe(done);
+    e.shr(e.rax, 51 - 22);
+    e.and_(e.eax, 1u << 22);
+    e.and_(i.dest, ~(1u << 22));
+    e.or_(i.dest, e.eax);
+    e.L(done);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_PACK_SINGLE, PACK_SINGLE);
+// ============================================================================
+// OPCODE_ROUND
+// ============================================================================
+struct ROUND_F32 : Sequence<ROUND_F32, I<OPCODE_ROUND, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(ROUND_F32);
+  }
+};
+struct ROUND_F64 : Sequence<ROUND_F64, I<OPCODE_ROUND, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    switch (i.instr->flags) {
+      case ROUND_TO_ZERO:
+        e.vroundsd(i.dest, src1, src1, 0b00000011);
+        break;
+      case ROUND_TO_NEAREST:
+        e.vroundsd(i.dest, src1, src1, 0b00000000);
+        break;
+      case ROUND_TO_MINUS_INFINITY:
+        e.vroundsd(i.dest, src1, src1, 0b00000001);
+        break;
+      case ROUND_TO_POSITIVE_INFINITY:
+        e.vroundsd(i.dest, src1, src1, 0b00000010);
+        break;
+      case ROUND_DYNAMIC:
+        // Bit 2 takes the mode from MXCSR, which carries the guest's.
+        e.vroundsd(i.dest, src1, src1, 0b00000100);
+        break;
+    }
+  }
+};
+struct ROUND_V128 : Sequence<ROUND_V128, I<OPCODE_ROUND, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    // likely dead code
+    e.ChangeMxcsrMode(MXCSRMode::Vmx);
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    switch (i.instr->flags) {
+      case ROUND_TO_ZERO:
+        e.vroundps(i.dest, src1, 0b00000011);
+        break;
+      case ROUND_TO_NEAREST:
+        e.vroundps(i.dest, src1, 0b00000000);
+        break;
+      case ROUND_TO_MINUS_INFINITY:
+        e.vroundps(i.dest, src1, 0b00000001);
+        break;
+      case ROUND_TO_POSITIVE_INFINITY:
+        e.vroundps(i.dest, src1, 0b00000010);
+        break;
+    }
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_ROUND, ROUND_F32, ROUND_F64, ROUND_V128);
+
+// ============================================================================
+// OPCODE_CLEAR_FP_EXCEPTIONS
+// ============================================================================
+struct CLEAR_FP_EXCEPTIONS
+    : Sequence<CLEAR_FP_EXCEPTIONS, I<OPCODE_CLEAR_FP_EXCEPTIONS, VoidOp>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    // The stored mxcsr always has the sticky flags clear, so reloading it is
+    // both the mode we want and the clear.
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    e.vldmxcsr(e.GetBackendCtxPtr(offsetof(X64BackendContext, mxcsr_fpu)));
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_CLEAR_FP_EXCEPTIONS, CLEAR_FP_EXCEPTIONS);
+
+// ============================================================================
+// OPCODE_LOAD_FP_EXCEPTIONS
+// ============================================================================
+struct LOAD_FP_EXCEPTIONS
+    : Sequence<LOAD_FP_EXCEPTIONS, I<OPCODE_LOAD_FP_EXCEPTIONS, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    auto scratch =
+        e.GetBackendCtxPtr(offsetof(X64BackendContext, helper_scratch_u64s[0]));
+    e.vstmxcsr(scratch);
+    e.mov(i.dest, scratch);
+    // IE DE ZE OE UE PE -> invalid, div by zero, overflow, underflow, inexact.
+    // Dropping DE closes the gap, so everything above it shifts down one.
+    e.mov(e.eax, i.dest);
+    e.shr(i.dest, 1);
+    e.and_(i.dest, 0x1E);
+    e.and_(e.eax, FP_EXCEPTION_INVALID);
+    e.or_(i.dest, e.eax);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_LOAD_FP_EXCEPTIONS, LOAD_FP_EXCEPTIONS);
+
+// ============================================================================
+// OPCODE_LOAD_CLOCK
+// ============================================================================
+struct LOAD_CLOCK : Sequence<LOAD_CLOCK, I<OPCODE_LOAD_CLOCK, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (cvars::inline_loadclock) {
+      e.mov(e.rcx,
+            e.GetBackendCtxPtr(offsetof(X64BackendContext, guest_tick_count)));
+      e.mov(i.dest, e.qword[e.rcx]);
+    } else {
+      // When scaling is disabled and the raw clock source is selected, the code
+      // in the Clock class is actually just forwarding tick counts after one
+      // simple multiply and division. In that case we rather bake the scaling
+      // in here to cut extra function calls with CPU cache misses and stack
+      // frame overhead.
+      if (cvars::clock_no_scaling && cvars::clock_source_raw) {
+        auto ratio = Clock::guest_tick_ratio();
+        // The 360 CPU is an in-order CPU, AMD64 usually isn't. Without
+        // mfence/lfence magic the rdtsc instruction can be executed sooner or
+        // later in the cache window. Since it's resolution however is much
+        // higher than the 360's mftb instruction this can safely be ignored.
+
+        // Read time stamp in edx (high part) and eax (low part).
+        e.rdtsc();
+        // Make it a 64 bit number in rax.
+        e.shl(e.rdx, 32);
+        e.or_(e.rax, e.rdx);
+        // Apply tick frequency scaling.
+        e.mov(e.rcx, ratio.first);
+        e.mul(e.rcx);
+        // We actually now have a 128 bit number in rdx:rax.
+        e.mov(e.rcx, ratio.second);
+        e.div(e.rcx);
+        e.mov(i.dest, e.rax);
+      } else {
+        e.CallNative(LoadClock);
+        e.mov(i.dest, e.rax);
+      }
+    }
+  }
+  static uint64_t LoadClock(void* raw_context) {
+    return Clock::QueryGuestTickCount();
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_LOAD_CLOCK, LOAD_CLOCK);
+
+// ============================================================================
+// OPCODE_CONTEXT_BARRIER
+// ============================================================================
+struct CONTEXT_BARRIER
+    : Sequence<CONTEXT_BARRIER, I<OPCODE_CONTEXT_BARRIER, VoidOp>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {}
+};
+EMITTER_OPCODE_TABLE(OPCODE_CONTEXT_BARRIER, CONTEXT_BARRIER);
+
+// ============================================================================
+// OPCODE_MAX
+// ============================================================================
+struct MAX_F32 : Sequence<MAX_F32, I<OPCODE_MAX, F32Op, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    EmitCommutativeBinaryXmmOp(e, i,
+                               [](X64Emitter& e, Xmm dest, Xmm src1, Xmm src2) {
+                                 e.vmaxss(dest, src1, src2);
+                               });
+  }
+};
+struct MAX_F64 : Sequence<MAX_F64, I<OPCODE_MAX, F64Op, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    EmitCommutativeBinaryXmmOp(e, i,
+                               [](X64Emitter& e, Xmm dest, Xmm src1, Xmm src2) {
+                                 e.vmaxsd(dest, src1, src2);
+                               });
+  }
+};
+struct MAX_V128 : Sequence<MAX_V128, I<OPCODE_MAX, V128Op, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Vmx);
+    // if 0 and -0, return 0! opposite of minfp
+    const Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    const Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+
+    e.vmaxps(e.xmm2, src1, src2);
+    e.vmaxps(e.xmm3, src2, src1);
+    e.vandps(e.xmm2, e.xmm2, e.xmm3);
+
+    e.vcmpunordps(e.xmm3, src1, src1);  // mask: vA is NaN
+    e.vblendvps(e.xmm3, src2, src1, e.xmm3);
+    // Hardware returns that operand quieted. Lanes with no NaN are dropped by
+    // the blend below, so this needs no mask of its own.
+    e.vorps(e.xmm3, e.xmm3, e.GetXmmConstPtr(XMMQuietBit));
+
+    e.vcmpunordps(i.dest, src1, src2);  // mask: vA or vB is NaN
+    e.vblendvps(i.dest, e.xmm2, e.xmm3, i.dest);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_MAX, MAX_F32, MAX_F64, MAX_V128);
+
+// ============================================================================
+// OPCODE_SINGLE_RANGE_QUIRK
+// ============================================================================
+// quirk = (any operand nonzero and outside [2^-149, 2^128)) && (all operands
+// finite), as i8 0/1.
+struct SINGLE_RANGE_QUIRK
+    : Sequence<SINGLE_RANGE_QUIRK,
+               I<OPCODE_SINGLE_RANGE_QUIRK, I8Op, F64Op, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    const Xmm ops[3] = {GetInputRegOrConstant(e, i.src1, e.xmm0),
+                        GetInputRegOrConstant(e, i.src2, e.xmm1),
+                        GetInputRegOrConstant(e, i.src3, e.xmm2)};
+    // rcx = max(bits - 2^-149's bits), both without the sign and shifted up by
+    // one, a zero taken as 2^-149: below 2^128's the same way iff every
+    // operand is zero or in range. Infinities and NaNs land above it too.
+    e.mov(e.rdx, 0x6D40000000000000ull);
+    for (int k = 0; k < 3; ++k) {
+      const auto& gp = (k == 0) ? e.rcx : e.rax;
+      e.vmovq(gp, ops[k]);
+      e.add(gp, gp);  // Discard the sign bit.
+      e.cmovz(gp, e.rdx);
+      e.sub(gp, e.rdx);
+      if (k != 0) {
+        e.cmp(e.rax, e.rcx);
+        e.cmova(e.rcx, e.rax);
+      }
+    }
+    e.mov(e.rax, 0x22A0000000000000ull);
+    e.cmp(e.rcx, e.rax);
+    Xbyak::Label slow, done;
+    e.jae(slow);
+    e.xor_(i.dest.reg().cvt32(), i.dest.reg().cvt32());
+    e.jmp(done);
+
+    // rcx = max(|op|): below infinity iff every operand is finite.
+    e.L(slow);
+    for (int k = 0; k < 3; ++k) {
+      const auto& gp = (k == 0) ? e.rcx : e.rax;
+      e.vmovq(gp, ops[k]);
+      e.btr(gp, 63);
+      if (k != 0) {
+        e.cmp(e.rax, e.rcx);
+        e.cmova(e.rcx, e.rax);
+      }
+    }
+    e.mov(e.rax, 0x7FF0000000000000ull);
+    e.cmp(e.rcx, e.rax);
+    e.setb(i.dest);
+    e.L(done);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_SINGLE_RANGE_QUIRK, SINGLE_RANGE_QUIRK);
+
+// ============================================================================
+// OPCODE_MIN
+// ============================================================================
+struct MIN_I8 : Sequence<MIN_I8, I<OPCODE_MIN, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitCommutativeBinaryOp(
+        e, i,
+        [](X64Emitter& e, const Reg8& dest_src, const Reg8& src) {
+          e.cmp(dest_src, src);
+          e.cmovg(dest_src.cvt32(), src.cvt32());
+        },
+        [](X64Emitter& e, const Reg8& dest_src, int32_t constant) {
+          e.mov(e.al, constant);
+          e.cmp(dest_src, e.al);
+          e.cmovg(dest_src.cvt32(), e.eax);
+        });
+  }
+};
+struct MIN_I16 : Sequence<MIN_I16, I<OPCODE_MIN, I16Op, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(MIN_I16);
+  }
+};
+struct MIN_I32 : Sequence<MIN_I32, I<OPCODE_MIN, I32Op, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(MIN_I32);
+  }
+};
+struct MIN_I64 : Sequence<MIN_I64, I<OPCODE_MIN, I64Op, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(MIN_I64);
+  }
+};
+struct MIN_F32 : Sequence<MIN_F32, I<OPCODE_MIN, F32Op, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    EmitCommutativeBinaryXmmOp(e, i,
+                               [](X64Emitter& e, Xmm dest, Xmm src1, Xmm src2) {
+                                 e.vminss(dest, src1, src2);
+                               });
+  }
+};
+struct MIN_F64 : Sequence<MIN_F64, I<OPCODE_MIN, F64Op, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    EmitCommutativeBinaryXmmOp(e, i,
+                               [](X64Emitter& e, Xmm dest, Xmm src1, Xmm src2) {
+                                 e.vminsd(dest, src1, src2);
+                               });
+  }
+};
+struct MIN_V128 : Sequence<MIN_V128, I<OPCODE_MIN, V128Op, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Vmx);
+    const Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    const Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+
+    e.vminps(e.xmm2, src1, src2);
+    e.vminps(e.xmm3, src2, src1);
+    e.vorps(e.xmm2, e.xmm2, e.xmm3);
+
+    e.vcmpunordps(e.xmm3, src1, src1);  // mask: vA is NaN
+    e.vblendvps(e.xmm3, src2, src1, e.xmm3);
+    // Hardware returns that operand quieted. Lanes with no NaN are dropped by
+    // the blend below, so this needs no mask of its own.
+    e.vorps(e.xmm3, e.xmm3, e.GetXmmConstPtr(XMMQuietBit));
+
+    e.vcmpunordps(i.dest, src1, src2);  // mask: vA or vB is NaN
+    e.vblendvps(i.dest, e.xmm2, e.xmm3, i.dest);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_MIN, MIN_I8, MIN_I16, MIN_I32, MIN_I64, MIN_F32,
+                     MIN_F64, MIN_V128);
+
+// ============================================================================
+// OPCODE_SELECT
+// ============================================================================
+// dest = src1 ? src2 : src3
+// TODO(benvanik): match compare + select sequences, as often it's something
+//     like SELECT(VECTOR_COMPARE_SGE(a, b), a, b)
+struct SELECT_I8
+    : Sequence<SELECT_I8, I<OPCODE_SELECT, I8Op, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    Reg8 src2;
+    if (i.src2.is_constant) {
+      src2 = e.al;
+      e.mov(src2, i.src2.constant());
+    } else {
+      src2 = i.src2;
+    }
+    Reg8 src3;
+    if (i.src3.is_constant) {
+      src3 = e.dl;
+      e.mov(src3, i.src3.constant());
+    } else {
+      src3 = i.src3;
+    }
+    e.test(i.src1, i.src1);
+    e.cmovnz(i.dest.reg().cvt32(), src2.cvt32());
+    e.cmovz(i.dest.reg().cvt32(), src3.cvt32());
+  }
+};
+struct SELECT_I16
+    : Sequence<SELECT_I16, I<OPCODE_SELECT, I16Op, I8Op, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    Reg16 src2;
+    if (i.src2.is_constant) {
+      src2 = e.ax;
+      e.mov(src2, i.src2.constant());
+    } else {
+      src2 = i.src2;
+    }
+    Reg16 src3;
+    if (i.src3.is_constant) {
+      src3 = e.dx;
+      e.mov(src3, i.src3.constant());
+    } else {
+      src3 = i.src3;
+    }
+    e.test(i.src1, i.src1);
+    e.cmovnz(i.dest.reg().cvt32(), src2.cvt32());
+    e.cmovz(i.dest.reg().cvt32(), src3.cvt32());
+  }
+};
+struct SELECT_I32
+    : Sequence<SELECT_I32, I<OPCODE_SELECT, I32Op, I8Op, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    Reg32 src2;
+    if (i.src2.is_constant) {
+      src2 = e.eax;
+      e.mov(src2, i.src2.constant());
+    } else {
+      src2 = i.src2;
+    }
+    Reg32 src3;
+    if (i.src3.is_constant) {
+      src3 = e.edx;
+      e.mov(src3, i.src3.constant());
+    } else {
+      src3 = i.src3;
+    }
+    e.test(i.src1, i.src1);
+    e.cmovnz(i.dest, src2);
+    e.cmovz(i.dest, src3);
+  }
+};
+struct SELECT_I64
+    : Sequence<SELECT_I64, I<OPCODE_SELECT, I64Op, I8Op, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    Reg64 src2;
+    if (i.src2.is_constant) {
+      src2 = e.rax;
+      e.mov(src2, i.src2.constant());
+    } else {
+      src2 = i.src2;
+    }
+    Reg64 src3;
+    if (i.src3.is_constant) {
+      src3 = e.rdx;
+      e.mov(src3, i.src3.constant());
+    } else {
+      src3 = i.src3;
+    }
+    e.test(i.src1, i.src1);
+    e.cmovnz(i.dest, src2);
+    e.cmovz(i.dest, src3);
+  }
+};
+struct SELECT_F32
+    : Sequence<SELECT_F32, I<OPCODE_SELECT, F32Op, I8Op, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(SELECT_F32);
+  }
+};
+struct SELECT_F64
+    : Sequence<SELECT_F64, I<OPCODE_SELECT, F64Op, I8Op, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    // dest = src1 != 0 ? src2 : src3
+
+    // A constant arm starts free in a GPR rather than needing an xmm of its
+    // own, so the choice itself runs on the integer ports and only the other
+    // arm and the result cross domains.
+    if (i.src2.is_constant != i.src3.is_constant) {
+      const bool constant_is_true_arm = i.src2.is_constant;
+      e.mov(e.rax, constant_is_true_arm ? i.src2.value->constant.u64
+                                        : i.src3.value->constant.u64);
+      e.vmovq(e.rcx, constant_is_true_arm ? i.src3.reg() : i.src2.reg());
+      e.test(i.src1, i.src1);
+      if (constant_is_true_arm) {
+        e.cmovz(e.rax, e.rcx);
+      } else {
+        e.cmovnz(e.rax, e.rcx);
+      }
+      e.vmovq(i.dest, e.rax);
+      return;
+    }
+
+    if (e.IsFeatureEnabled(kX64EmitAVX512Ortho)) {
+      e.movzx(e.rax, i.src1);
+      e.vmovq(e.xmm0, e.rax);
+      e.vptestmq(e.k1, e.xmm0, e.xmm0);
+
+      const Xmm src2 = i.src2.is_constant ? e.xmm1 : i.src2;
+      if (i.src2.is_constant) {
+        e.LoadConstantXmm(src2, i.src2.constant());
+      }
+
+      const Xmm src3 = i.src3.is_constant ? e.xmm2 : i.src3;
+      if (i.src3.is_constant) {
+        e.LoadConstantXmm(src3, i.src3.constant());
+      }
+
+      e.vpblendmq(i.dest.reg() | e.k1, src3, src2);
+      return;
+    }
+
+    // Negating the 0/1 condition fills the sign bit the blend selects on.
+    e.movzx(e.eax, i.src1);
+    e.neg(e.rax);
+    e.vmovq(e.xmm0, e.rax);
+
+    // Distinct scratch per arm: a blend reads both at once.
+    Xmm src2 = i.src2.is_constant ? e.xmm1 : i.src2;
+    if (i.src2.is_constant) {
+      e.LoadConstantXmm(src2, i.src2.constant());
+    }
+
+    Xmm src3 = i.src3.is_constant ? e.xmm2 : i.src3;
+    if (i.src3.is_constant) {
+      e.LoadConstantXmm(src3, i.src3.constant());
+    }
+
+    e.vblendvpd(i.dest, src3, src2, e.xmm0);
+  }
+};
+struct SELECT_V128_I8
+    : Sequence<SELECT_V128_I8, I<OPCODE_SELECT, V128Op, I8Op, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(SELECT_V128_I8);
+  }
+};
+
+enum class PermittedBlend : uint32_t { NotPermitted, Int8, Ps };
+static bool IsVectorCompare(const Instr* i) {
+  Opcode op = i->opcode->num;
+  return op >= OPCODE_VECTOR_COMPARE_EQ && op <= OPCODE_VECTOR_COMPARE_UGE;
+}
+// vpblendvb only needs each byte to be 0x00 or 0xFF, but vblendvps picks a
+// whole 32-bit lane off that lane's high bit, so it additionally needs the
+// lane to be uniform.
+static PermittedBlend GetPermittedBlendForConstant(const vec128_t& c) {
+  for (int i = 0; i < 16; ++i) {
+    if (c.u8[i] != 0x00 && c.u8[i] != 0xFF) {
+      return PermittedBlend::NotPermitted;
+    }
+  }
+  for (int i = 0; i < 4; ++i) {
+    if (c.u32[i] != 0x00000000u && c.u32[i] != 0xFFFFFFFFu) {
+      return PermittedBlend::Int8;
+    }
+  }
+  return PermittedBlend::Ps;
+}
+
+// Bounds the walk below over selectors built from chained bitwise ops.
+static constexpr unsigned kMaxBlendSelectorDepth = 4;
+
+/*
+    OPCODE_SELECT does a bit by bit selection, however, if the selector is the
+   result of a comparison or if each element may only be 0xff or 0 we may use a
+   blend instruction instead
+*/
+static PermittedBlend GetPermittedBlendForSelectV128(const Value* src1v,
+                                                     unsigned depth = 0) {
+  if (src1v->IsConstant()) {
+    return GetPermittedBlendForConstant(src1v->constant.v128);
+  }
+  const Instr* df = src1v->def;
+  if (!df) {
+    return PermittedBlend::NotPermitted;
+  }
+  if (IsVectorCompare(df)) {
+    switch (df->flags) {  // check what datatype we compared as
+      case INT16_TYPE:
+      case INT32_TYPE:
+      case INT8_TYPE:
+        return PermittedBlend::Int8;  // use vpblendvb
+      case FLOAT32_TYPE:
+        return PermittedBlend::Ps;  // use vblendvps
+      default:                      // unknown type! just ignore
+        return PermittedBlend::NotPermitted;
+    }
+  }
+  if (depth >= kMaxBlendSelectorDepth) {
+    return PermittedBlend::NotPermitted;
+  }
+  // The bitwise ops map {0x00, 0xFF} onto itself bytewise, so a selector built
+  // by combining comparisons still blends.
+  switch (df->opcode->num) {
+    case OPCODE_NOT:
+      return GetPermittedBlendForSelectV128(df->src1.value, depth + 1);
+    case OPCODE_AND:
+    case OPCODE_AND_NOT:
+    case OPCODE_OR:
+    case OPCODE_XOR: {
+      PermittedBlend lhs =
+          GetPermittedBlendForSelectV128(df->src1.value, depth + 1);
+      if (lhs == PermittedBlend::NotPermitted) {
+        return PermittedBlend::NotPermitted;
+      }
+      PermittedBlend rhs =
+          GetPermittedBlendForSelectV128(df->src2.value, depth + 1);
+      if (rhs == PermittedBlend::NotPermitted) {
+        return PermittedBlend::NotPermitted;
+      }
+      // Lane uniformity only survives if both sides had it.
+      return (lhs == PermittedBlend::Ps && rhs == PermittedBlend::Ps)
+                 ? PermittedBlend::Ps
+                 : PermittedBlend::Int8;
+    }
+    default:
+      return PermittedBlend::NotPermitted;
+  }
+}
+struct SELECT_V128_V128
+    : Sequence<SELECT_V128_V128,
+               I<OPCODE_SELECT, V128Op, V128Op, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    const Xmm src1 = i.src1.is_constant ? e.xmm0 : i.src1;
+    PermittedBlend mayblend = GetPermittedBlendForSelectV128(i.src1.value);
+    // todo: prove src1 is only 0 or FFFF for the cases the walk above can't
+    // reach, e.g. a mask loaded from memory
+    if (i.src1.is_constant) {
+      e.LoadConstantXmm(src1, i.src1.constant());
+    }
+
+    const Xmm src2 = i.src2.is_constant ? e.xmm1 : i.src2;
+    if (i.src2.is_constant) {
+      e.LoadConstantXmm(src2, i.src2.constant());
+    }
+
+    const Xmm src3 = i.src3.is_constant ? e.xmm2 : i.src3;
+    if (i.src3.is_constant) {
+      e.LoadConstantXmm(src3, i.src3.constant());
+    }
+
+    if (e.IsFeatureEnabled(kX64EmitAVX512Ortho)) {
+      e.vmovdqa(e.xmm3, src1);
+      e.vpternlogd(e.xmm3, src2, src3,
+                   (~TernaryOperand::a & TernaryOperand::b) |
+                       (TernaryOperand::c & TernaryOperand::a));
+      e.vmovdqa(i.dest, e.xmm3);
+      return;
+    }
+
+    if (mayblend == PermittedBlend::Int8) {
+      e.vpblendvb(i.dest, src2, src3, src1);
+    } else if (mayblend == PermittedBlend::Ps) {
+      e.vblendvps(i.dest, src2, src3, src1);
+    } else {
+      if (e.IsFeatureEnabled(kX64EmitXOP)) {
+        e.vpcmov(i.dest, src3, src2, src1);
+      } else {
+        // src1 ? src2 : src3;
+
+        e.vpandn(e.xmm3, src1, src2);
+        e.vpand(i.dest, src1, src3);
+        e.vpor(i.dest, i.dest, e.xmm3);
+      }
+    }
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_SELECT, SELECT_I8, SELECT_I16, SELECT_I32,
+                     SELECT_I64, SELECT_F32, SELECT_F64, SELECT_V128_I8,
+                     SELECT_V128_V128);
+
+static const hir::Instr* GetFirstPrecedingInstrWithPossibleFlagEffects(
+    const hir::Instr* i) {
+  Opcode iop;
+
+go_further:
+  i = i->GetNonFakePrev();
+  if (!i) {
+    return nullptr;
+  }
+  iop = i->opcode->num;
+  // context/local loads are just movs from mem. we know they will not spoil the
+  // flags
+  switch (iop) {
+    case OPCODE_LOAD_CONTEXT:
+    case OPCODE_STORE_CONTEXT:
+    case OPCODE_LOAD_LOCAL:
+    case OPCODE_STORE_LOCAL:
+    case OPCODE_ASSIGN:
+      goto go_further;
+    default:
+      return i;
+  }
+}
+
+static bool HasPrecedingCmpOfSameValues(const hir::Instr* i) {
+  if (IsTracingData()) {
+    return false;  // no cmp elim if tracing
+  }
+  auto prev = GetFirstPrecedingInstrWithPossibleFlagEffects(i);
+
+  if (prev == nullptr) {
+    return false;
+  }
+
+  Opcode num = prev->opcode->num;
+
+  if (num < OPCODE_COMPARE_EQ || num > OPCODE_COMPARE_UGE) {
+    return false;
+  }
+
+  return prev->src1.value->IsEqual(i->src1.value) &&
+         prev->src2.value->IsEqual(i->src2.value);
+}
+static bool MayCombineSetxWithFollowingCtxStore(const hir::Instr* setx_insn,
+                                                unsigned& out_offset) {
+  if (IsTracingData()) {
+    return false;
+  }
+  hir::Value* defed = setx_insn->dest;
+
+  if (!defed->HasSingleUse()) {
+    return false;
+  }
+  hir::Value::Use* single_use = defed->use_head;
+
+  hir::Instr* shouldbestore = single_use->instr;
+
+  if (!shouldbestore) {
+    return false;  // probs impossible
+  }
+
+  if (shouldbestore->opcode->num == OPCODE_STORE_CONTEXT) {
+    if (shouldbestore->GetNonFakePrev() == setx_insn) {
+      out_offset = static_cast<unsigned>(shouldbestore->src1.offset);
+      shouldbestore->backend_flags |=
+          INSTR_X64_FLAGS_ELIMINATED;  // eliminate store
+      return true;
+    }
+  }
+  return false;
+}
+
+// ============================================================================
+// OPCODE_IS_NAN
+// ============================================================================
+struct IS_NAN_F32 : Sequence<IS_NAN_F32, I<OPCODE_IS_NAN, I8Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(IS_NAN_F32);
+  }
+};
+
+struct IS_NAN_F64 : Sequence<IS_NAN_F64, I<OPCODE_IS_NAN, I8Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    e.vucomisd(i.src1, i.src1);
+    e.setp(i.dest);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_IS_NAN, IS_NAN_F32, IS_NAN_F64);
+
+template <typename dest>
+static void CompareEqDoSete(X64Emitter& e, const Instr* instr,
+                            const dest& dst) {
+  unsigned ctxoffset = 0;
+  if (MayCombineSetxWithFollowingCtxStore(instr, ctxoffset)) {
+    e.sete(e.byte[e.GetContextReg() + ctxoffset]);
+  } else {
+    e.sete(dst);
+  }
+}
+
+// ============================================================================
+// OPCODE_COMPARE_EQ
+// ============================================================================
+struct COMPARE_EQ_I8
+    : Sequence<COMPARE_EQ_I8, I<OPCODE_COMPARE_EQ, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    // x86 flags already set?
+    if (!HasPrecedingCmpOfSameValues(i.instr)) {
+      EmitCommutativeCompareOp(
+          e, i,
+          [](X64Emitter& e, const Reg8& src1, const Reg8& src2) {
+            e.cmp(src1, src2);
+          },
+          [](X64Emitter& e, const Reg8& src1, int32_t constant) {
+            if (constant == 0) {
+              e.test(src1, src1);
+            } else {
+              e.cmp(src1, constant);
+            }
+          });
+    }
+    CompareEqDoSete(e, i.instr, i.dest);
+  }
+};
+struct COMPARE_EQ_I16
+    : Sequence<COMPARE_EQ_I16, I<OPCODE_COMPARE_EQ, I8Op, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (!HasPrecedingCmpOfSameValues(i.instr)) {
+      EmitCommutativeCompareOp(
+          e, i,
+          [](X64Emitter& e, const Reg16& src1, const Reg16& src2) {
+            e.cmp(src1, src2);
+          },
+          [](X64Emitter& e, const Reg16& src1, int32_t constant) {
+            if (constant == 0) {
+              e.test(src1, src1);
+            } else {
+              e.cmp(src1, constant);
+            }
+          });
+    }
+    CompareEqDoSete(e, i.instr, i.dest);
+  }
+};
+struct COMPARE_EQ_I32
+    : Sequence<COMPARE_EQ_I32, I<OPCODE_COMPARE_EQ, I8Op, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (!HasPrecedingCmpOfSameValues(i.instr)) {
+      EmitCommutativeCompareOp(
+          e, i,
+          [](X64Emitter& e, const Reg32& src1, const Reg32& src2) {
+            e.cmp(src1, src2);
+          },
+          [](X64Emitter& e, const Reg32& src1, int32_t constant) {
+            if (constant == 0) {
+              e.test(src1, src1);
+            } else {
+              e.cmp(src1, constant);
+            }
+          });
+    }
+    CompareEqDoSete(e, i.instr, i.dest);
+  }
+};
+struct COMPARE_EQ_I64
+    : Sequence<COMPARE_EQ_I64, I<OPCODE_COMPARE_EQ, I8Op, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (!HasPrecedingCmpOfSameValues(i.instr)) {
+      EmitCommutativeCompareOp(
+          e, i,
+          [](X64Emitter& e, const Reg64& src1, const Reg64& src2) {
+            e.cmp(src1, src2);
+          },
+          [](X64Emitter& e, const Reg64& src1, int32_t constant) {
+            if (constant == 0) {
+              e.test(src1, src1);
+            } else {
+              e.cmp(src1, constant);
+            }
+          });
+    }
+    CompareEqDoSete(e, i.instr, i.dest);
+  }
+};
+struct COMPARE_EQ_F32
+    : Sequence<COMPARE_EQ_F32, I<OPCODE_COMPARE_EQ, I8Op, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    if (!HasPrecedingCmpOfSameValues(i.instr)) {
+      EmitCommutativeBinaryXmmOp(
+          e, i, [](X64Emitter& e, I8Op dest, const Xmm& src1, const Xmm& src2) {
+            e.vcomiss(src1, src2);
+          });
+    }
+    CompareEqDoSete(e, i.instr, i.dest);
+  }
+};
+struct COMPARE_EQ_F64
+    : Sequence<COMPARE_EQ_F64, I<OPCODE_COMPARE_EQ, I8Op, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    if (!HasPrecedingCmpOfSameValues(i.instr)) {
+      EmitCommutativeBinaryXmmOp(
+          e, i, [](X64Emitter& e, I8Op dest, const Xmm& src1, const Xmm& src2) {
+            e.vcomisd(src1, src2);
+          });
+    }
+    CompareEqDoSete(e, i.instr, i.dest);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_COMPARE_EQ, COMPARE_EQ_I8, COMPARE_EQ_I16,
+                     COMPARE_EQ_I32, COMPARE_EQ_I64, COMPARE_EQ_F32,
+                     COMPARE_EQ_F64);
+
+template <typename dest>
+static void CompareNeDoSetne(X64Emitter& e, const Instr* instr,
+                             const dest& dst) {
+  unsigned ctxoffset = 0;
+  if (MayCombineSetxWithFollowingCtxStore(instr, ctxoffset)) {
+    e.setne(e.byte[e.GetContextReg() + ctxoffset]);
+  } else {
+    e.setne(dst);
+  }
+}
+// ============================================================================
+// OPCODE_COMPARE_NE
+// ============================================================================
+struct COMPARE_NE_I8
+    : Sequence<COMPARE_NE_I8, I<OPCODE_COMPARE_NE, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (!HasPrecedingCmpOfSameValues(i.instr)) {
+      EmitCommutativeCompareOp(
+          e, i,
+          [](X64Emitter& e, const Reg8& src1, const Reg8& src2) {
+            e.cmp(src1, src2);
+          },
+          [](X64Emitter& e, const Reg8& src1, int32_t constant) {
+            e.cmp(src1, constant);
+          });
+    }
+    CompareNeDoSetne(e, i.instr, i.dest);
+  }
+};
+struct COMPARE_NE_I16
+    : Sequence<COMPARE_NE_I16, I<OPCODE_COMPARE_NE, I8Op, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (!HasPrecedingCmpOfSameValues(i.instr)) {
+      EmitCommutativeCompareOp(
+          e, i,
+          [](X64Emitter& e, const Reg16& src1, const Reg16& src2) {
+            e.cmp(src1, src2);
+          },
+          [](X64Emitter& e, const Reg16& src1, int32_t constant) {
+            e.cmp(src1, constant);
+          });
+    }
+    CompareNeDoSetne(e, i.instr, i.dest);
+  }
+};
+struct COMPARE_NE_I32
+    : Sequence<COMPARE_NE_I32, I<OPCODE_COMPARE_NE, I8Op, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (!HasPrecedingCmpOfSameValues(i.instr)) {
+      EmitCommutativeCompareOp(
+          e, i,
+          [](X64Emitter& e, const Reg32& src1, const Reg32& src2) {
+            e.cmp(src1, src2);
+          },
+          [](X64Emitter& e, const Reg32& src1, int32_t constant) {
+            if (constant == 0 && e.CanUseMembaseLow32As0()) {
+              e.cmp(src1, e.GetMembaseReg().cvt32());
+            } else {
+              e.cmp(src1, constant);
+            }
+          });
+    }
+    CompareNeDoSetne(e, i.instr, i.dest);
+  }
+};
+struct COMPARE_NE_I64
+    : Sequence<COMPARE_NE_I64, I<OPCODE_COMPARE_NE, I8Op, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (!HasPrecedingCmpOfSameValues(i.instr)) {
+      EmitCommutativeCompareOp(
+          e, i,
+          [](X64Emitter& e, const Reg64& src1, const Reg64& src2) {
+            e.cmp(src1, src2);
+          },
+          [](X64Emitter& e, const Reg64& src1, int32_t constant) {
+            e.cmp(src1, constant);
+          });
+    }
+    CompareNeDoSetne(e, i.instr, i.dest);
+  }
+};
+struct COMPARE_NE_F32
+    : Sequence<COMPARE_NE_F32, I<OPCODE_COMPARE_NE, I8Op, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    if (!HasPrecedingCmpOfSameValues(i.instr)) {
+      EmitCommutativeBinaryXmmOp(
+          e, i, [](X64Emitter& e, I8Op dest, const Xmm& src1, const Xmm& src2) {
+            e.vcomiss(src1, src2);
+          });
+    }
+    CompareNeDoSetne(e, i.instr, i.dest);
+  }
+};
+struct COMPARE_NE_F64
+    : Sequence<COMPARE_NE_F64, I<OPCODE_COMPARE_NE, I8Op, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    if (!HasPrecedingCmpOfSameValues(i.instr)) {
+      EmitCommutativeBinaryXmmOp(
+          e, i, [](X64Emitter& e, I8Op dest, const Xmm& src1, const Xmm& src2) {
+            e.vcomisd(src1, src2);
+          });
+    }
+    CompareNeDoSetne(e, i.instr, i.dest);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_COMPARE_NE, COMPARE_NE_I8, COMPARE_NE_I16,
+                     COMPARE_NE_I32, COMPARE_NE_I64, COMPARE_NE_F32,
+                     COMPARE_NE_F64);
+
+#define EMITTER_ASSOCIATE_CMP_INT_DO_SET(emit_instr, inverse_instr) \
+  unsigned ctxoffset = 0;                                           \
+  if (MayCombineSetxWithFollowingCtxStore(i.instr, ctxoffset)) {    \
+    auto addr = e.byte[e.GetContextReg() + ctxoffset];              \
+    if (!inverse) {                                                 \
+      e.emit_instr(addr);                                           \
+    } else {                                                        \
+      e.inverse_instr(addr);                                        \
+    }                                                               \
+  } else {                                                          \
+    if (!inverse) {                                                 \
+      e.emit_instr(dest);                                           \
+    } else {                                                        \
+      e.inverse_instr(dest);                                        \
+    }                                                               \
+  }
+// ============================================================================
+// OPCODE_COMPARE_*
+// ============================================================================
+#define EMITTER_ASSOCIATIVE_COMPARE_INT(op, emit_instr, inverse_instr, type, \
+                                        reg_type)                            \
+  struct COMPARE_##op##_##type                                               \
+      : Sequence<COMPARE_##op##_##type,                                      \
+                 I<OPCODE_COMPARE_##op, I8Op, type, type>> {                 \
+    static void Emit(X64Emitter& e, const EmitArgType& i) {                  \
+      EmitAssociativeCompareOp(                                              \
+          e, i,                                                              \
+          [&i](X64Emitter& e, const Reg8& dest, const reg_type& src1,        \
+               const reg_type& src2, bool inverse) {                         \
+            if (!HasPrecedingCmpOfSameValues(i.instr)) {                     \
+              e.cmp(src1, src2);                                             \
+            }                                                                \
+            EMITTER_ASSOCIATE_CMP_INT_DO_SET(emit_instr, inverse_instr)      \
+          },                                                                 \
+          [&i](X64Emitter& e, const Reg8& dest, const reg_type& src1,        \
+               int32_t constant, bool inverse) {                             \
+            if (!HasPrecedingCmpOfSameValues(i.instr)) {                     \
+              e.cmp(src1, constant);                                         \
+            }                                                                \
+            EMITTER_ASSOCIATE_CMP_INT_DO_SET(emit_instr, inverse_instr)      \
+          });                                                                \
+    }                                                                        \
+  };
+#define EMITTER_ASSOCIATIVE_COMPARE_XX(op, instr, inverse_instr)           \
+  EMITTER_ASSOCIATIVE_COMPARE_INT(op, instr, inverse_instr, I8Op, Reg8);   \
+  EMITTER_ASSOCIATIVE_COMPARE_INT(op, instr, inverse_instr, I16Op, Reg16); \
+  EMITTER_ASSOCIATIVE_COMPARE_INT(op, instr, inverse_instr, I32Op, Reg32); \
+  EMITTER_ASSOCIATIVE_COMPARE_INT(op, instr, inverse_instr, I64Op, Reg64); \
+  EMITTER_OPCODE_TABLE(OPCODE_COMPARE_##op, COMPARE_##op##_I8Op,           \
+                       COMPARE_##op##_I16Op, COMPARE_##op##_I32Op,         \
+                       COMPARE_##op##_I64Op);
+EMITTER_ASSOCIATIVE_COMPARE_XX(SLT, setl, setg);
+EMITTER_ASSOCIATIVE_COMPARE_XX(SLE, setle, setge);
+EMITTER_ASSOCIATIVE_COMPARE_XX(SGT, setg, setl);
+EMITTER_ASSOCIATIVE_COMPARE_XX(SGE, setge, setle);
+EMITTER_ASSOCIATIVE_COMPARE_XX(ULT, setb, seta);
+EMITTER_ASSOCIATIVE_COMPARE_XX(ULE, setbe, setae);
+EMITTER_ASSOCIATIVE_COMPARE_XX(UGT, seta, setb);
+EMITTER_ASSOCIATIVE_COMPARE_XX(UGE, setae, setbe);
+
+// https://web.archive.org/web/20171129015931/https://x86.renejeschke.de/html/file_module_x86_id_288.html
+// Original link: https://x86.renejeschke.de/html/file_module_x86_id_288.html
+#define EMITTER_ASSOCIATIVE_COMPARE_FLT_XX(op, emit_instr)                   \
+  struct COMPARE_##op##_F32                                                  \
+      : Sequence<COMPARE_##op##_F32,                                         \
+                 I<OPCODE_COMPARE_##op, I8Op, F32Op, F32Op>> {               \
+    static void Emit(X64Emitter& e, const EmitArgType& i) {                  \
+      e.ChangeMxcsrMode(MXCSRMode::Fpu);                                     \
+      if (!HasPrecedingCmpOfSameValues(i.instr)) {                           \
+        EmitAssociativeBinaryXmmOp(                                          \
+            e, i,                                                            \
+            [](X64Emitter& e, I8Op dest, const Xmm& src1, const Xmm& src2) { \
+              e.vcomiss(src1, src2);                                         \
+            });                                                              \
+      }                                                                      \
+      unsigned ctxoffset = 0;                                                \
+      if (MayCombineSetxWithFollowingCtxStore(i.instr, ctxoffset)) {         \
+        e.emit_instr(e.byte[e.GetContextReg() + ctxoffset]);                 \
+      } else {                                                               \
+        e.emit_instr(i.dest);                                                \
+      }                                                                      \
+    }                                                                        \
+  };                                                                         \
+  struct COMPARE_##op##_F64                                                  \
+      : Sequence<COMPARE_##op##_F64,                                         \
+                 I<OPCODE_COMPARE_##op, I8Op, F64Op, F64Op>> {               \
+    static void Emit(X64Emitter& e, const EmitArgType& i) {                  \
+      e.ChangeMxcsrMode(MXCSRMode::Fpu);                                     \
+      if (!HasPrecedingCmpOfSameValues(i.instr)) {                           \
+        EmitAssociativeBinaryXmmOp(                                          \
+            e, i,                                                            \
+            [](X64Emitter& e, I8Op dest, const Xmm& src1, const Xmm& src2) { \
+              e.vcomisd(src1, src2);                                         \
+            });                                                              \
+      }                                                                      \
+      unsigned ctxoffset = 0;                                                \
+      if (MayCombineSetxWithFollowingCtxStore(i.instr, ctxoffset)) {         \
+        e.emit_instr(e.byte[e.GetContextReg() + ctxoffset]);                 \
+      } else {                                                               \
+        e.emit_instr(i.dest);                                                \
+      }                                                                      \
+    }                                                                        \
+  };                                                                         \
+  EMITTER_OPCODE_TABLE(OPCODE_COMPARE_##op##_FLT, COMPARE_##op##_F32,        \
+                       COMPARE_##op##_F64);
+EMITTER_ASSOCIATIVE_COMPARE_FLT_XX(SLT, setb);
+EMITTER_ASSOCIATIVE_COMPARE_FLT_XX(SLE, setbe);
+EMITTER_ASSOCIATIVE_COMPARE_FLT_XX(SGT, seta);
+EMITTER_ASSOCIATIVE_COMPARE_FLT_XX(SGE, setae);
+EMITTER_ASSOCIATIVE_COMPARE_FLT_XX(ULT, setb);
+EMITTER_ASSOCIATIVE_COMPARE_FLT_XX(ULE, setbe);
+EMITTER_ASSOCIATIVE_COMPARE_FLT_XX(UGT, seta);
+EMITTER_ASSOCIATIVE_COMPARE_FLT_XX(UGE, setae);
+
+// ============================================================================
+// OPCODE_DID_SATURATE
+// ============================================================================
+struct DID_SATURATE
+    : Sequence<DID_SATURATE, I<OPCODE_DID_SATURATE, I8Op, V128Op>> {
+  // The PPC front end passes the lanes that saturated (see SetSatIfAny), so
+  // this is whether any is nonzero
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    e.vptest(src1, src1);
+    e.setnz(i.dest);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_DID_SATURATE, DID_SATURATE);
+
+// Marks the lanes of two packed doubles, in lanes, that are nonzero and outside
+// [2^-149, 2^128), infinities and NaNs among them. Clobbers temp.
+static void EmitSingleRangeBadLanes(X64Emitter& e, const Xmm& lanes,
+                                    const Xmm& temp) {
+  e.vpaddq(lanes, lanes, lanes);  // Discard the sign bit.
+  e.vpaddq(temp, lanes, e.GetXmmConstPtr(XMMSingleRangeBias));
+  e.vpcmpgtq(temp, temp, e.GetXmmConstPtr(XMMSingleRangeLimit));
+  e.vpcmpeqq(lanes, lanes, e.GetXmmConstPtr(XMMZero));
+  e.vpandn(lanes, lanes, temp);
+}
+
+// ARITHMETIC_SINGLE_RANGE, ahead of the operation. A branch rather than a
+// select keeps the check out of the result's dependency chain, and operands are
+// almost never outside the range. The tail gives the default QNaN unless an
+// operand is infinite or NaN, which takes precedence, and goes back to the
+// operation then. Only the operands that might be out of range are tested,
+// and none at all when every one is known to be in it: an infinite or NaN
+// operand only matters once another is out of range, and the tail tests all
+// of them for that. Returns a label to place after the operation, if one's
+// needed.
+template <int operands, typename ARGS>
+static Xbyak::Label* EmitSingleRangeCheck(X64Emitter& e, const ARGS& i) {
+  if (!(i.instr->flags & ARITHMETIC_SINGLE_RANGE)) {
+    return nullptr;
+  }
+  const Value* sources[3] = {i.src1.value, i.src2.value, nullptr};
+  if constexpr (operands == 3) {
+    sources[2] = i.src3.value;
+  }
+  int unknown[3];
+  int unknown_count = 0;
+  for (int n = 0; n < operands; ++n) {
+    if (!sources[n]->IsInSingleRange()) {
+      unknown[unknown_count++] = n;
+    }
+  }
+  if (!unknown_count) {
+    return nullptr;
+  }
+  Xbyak::Label& done = e.NewCachedLabel();
+  Xbyak::Label& resume = e.NewCachedLabel();
+  Xbyak::Label& out_of_range =
+      e.AddToTail([i, &done, &resume](X64Emitter& e, Xbyak::Label& tail) {
+        e.L(tail);
+        auto resume_if_nonfinite = [&e, &resume](const Xmm& operand) {
+          e.vmovq(e.rax, operand);
+          e.add(e.rax, e.rax);  // Discard the sign bit.
+          e.mov(e.rcx, 0xFFE0000000000000ull);
+          e.cmp(e.rax, e.rcx);
+          e.jae(resume, X64Emitter::T_NEAR);
+        };
+        resume_if_nonfinite(GetInputRegOrConstant(e, i.src1, e.xmm0));
+        resume_if_nonfinite(GetInputRegOrConstant(e, i.src2, e.xmm0));
+        if constexpr (operands == 3) {
+          resume_if_nonfinite(GetInputRegOrConstant(e, i.src3, e.xmm0));
+        }
+        e.mov(e.rax, 0x7FF8000000000000ull);
+        e.vmovq(i.dest, e.rax);
+        e.jmp(done, X64Emitter::T_NEAR);
+      });
+  auto source = [&e, &i](int n, const Xmm& scratch) -> Xmm {
+    if (n == 0) {
+      return GetInputRegOrConstant(e, i.src1, scratch);
+    }
+    if constexpr (operands == 3) {
+      if (n == 2) {
+        return GetInputRegOrConstant(e, i.src3, scratch);
+      }
+    }
+    return GetInputRegOrConstant(e, i.src2, scratch);
+  };
+  // The first two in xmm2, with a zero upper lane if there's one
+  Xmm first = source(unknown[0], e.xmm0);
+  if (unknown_count == 1) {
+    e.vmovq(e.xmm2, first);
+  } else {
+    e.vunpcklpd(e.xmm2, first, source(unknown[1], e.xmm1));
+  }
+  if (unknown_count == 3) {
+    Xmm third = source(unknown[2], e.xmm0);
+    e.vunpcklpd(e.xmm0, third, third);
+    EmitSingleRangeBadLanes(e, e.xmm2, e.xmm3);
+    EmitSingleRangeBadLanes(e, e.xmm0, e.xmm1);
+    e.vpor(e.xmm2, e.xmm2, e.xmm0);
+    e.vptest(e.xmm2, e.xmm2);
+    e.jnz(out_of_range, X64Emitter::T_NEAR);
+  } else {
+    // EmitSingleRangeBadLanes without its vpandn: vptest sets CF when no lane
+    // is outside the range and not zero.
+    e.vpaddq(e.xmm2, e.xmm2, e.xmm2);  // Discard the sign bit.
+    e.vpaddq(e.xmm3, e.xmm2, e.GetXmmConstPtr(XMMSingleRangeBias));
+    e.vpcmpgtq(e.xmm3, e.xmm3, e.GetXmmConstPtr(XMMSingleRangeLimit));
+    e.vpcmpeqq(e.xmm2, e.xmm2, e.GetXmmConstPtr(XMMZero));
+    e.vptest(e.xmm2, e.xmm3);
+    e.jnc(out_of_range, X64Emitter::T_NEAR);
+  }
+  e.L(resume);
+  return &done;
+}
+
+// Fuses the TO_SINGLE_KEEP_NAN right after an F64 operation that reads its
+// result (see X64Emitter::MarkFusedToSingle). Only for operations whose every
+// NaN result leaves through exits bound with BindNanExit, and before any is.
+static void FuseToSingleIfNext(X64Emitter& e, const Instr* instr) {
+  const Instr* next = instr->next;
+  if (cvars::no_round_to_single || !next ||
+      next->GetOpcodeNum() != OPCODE_TO_SINGLE ||
+      !(next->flags & TO_SINGLE_KEEP_NAN) || next->src1.value != instr->dest) {
+    return;
+  }
+  assert_null(e.fused_to_single());
+  e.MarkFusedToSingle(next, &e.NewCachedLabel());
+}
+
+// Binds exit, which an F64 operation's tails return to with a NaN in dest.
+// Fused with a TO_SINGLE, exit starts a stub instead that hands the NaN to the
+// TO_SINGLE's dest and jumps past its conversion, while the hot path, which
+// has no NaN, runs on into it.
+static void BindNanExit(X64Emitter& e, Xbyak::Label& exit, const Xmm& dest) {
+  const Instr* to_single = e.fused_to_single();
+  if (!to_single) {
+    e.L(exit);
+    return;
+  }
+  Xmm to_single_dest;
+  X64Emitter::SetupReg(to_single->dest, to_single_dest);
+  Xbyak::Label* past = e.fused_to_single_exit();
+  e.AddToTail(
+      [&exit, dest, to_single_dest, past](X64Emitter& e, Xbyak::Label& tail) {
+        e.L(tail);
+        e.L(exit);
+        if (to_single_dest.getIdx() != dest.getIdx()) {
+          e.vmovapd(to_single_dest, dest);
+        }
+        e.jmp(*past, e.T_NEAR);
+      });
+}
+
+// An invalid operation with no NaN operand answers with the default QNaN, and
+// x86's is negative where PPC's is positive. Only a NaN result can need the
+// fixup, so the test stays off the result's dependency chain and the work goes
+// to a tail block.
+template <typename ARGS, typename FN>
+static void EmitBinaryFpWithPpcDefaultNan_F64(X64Emitter& e, const ARGS& i,
+                                              FN&& emit_op) {
+  // The tail reads the original operands, so an aliased dest stages via xmm2.
+  const bool aliased = (!i.src1.is_constant && i.dest.reg() == i.src1.reg()) ||
+                       (!i.src2.is_constant && i.dest.reg() == i.src2.reg());
+  const Xmm target = aliased ? e.xmm2 : i.dest.reg();
+  Xbyak::Label& done = e.NewCachedLabel();
+  Xbyak::Label& invalid =
+      e.AddToTail([i, aliased, &done](X64Emitter& e, Xbyak::Label& tail) {
+        e.L(tail);
+        Xbyak::Label propagate;
+        // Re-derive rather than capture: a constant operand lives in xmm0 or
+        // xmm1, which the hot path is free to reuse.
+        Xmm s1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+        Xmm s2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+        e.vucomisd(s1, s1);
+        e.jp(propagate);
+        e.vucomisd(s2, s2);
+        e.jp(propagate);
+        e.mov(e.rax, 0x7FF8000000000000ull);
+        e.vmovq(i.dest, e.rax);
+        e.jmp(done, X64Emitter::T_NEAR);
+        e.L(propagate);
+        if (aliased) {
+          e.vmovapd(i.dest, e.xmm2);
+        }
+        e.jmp(done, X64Emitter::T_NEAR);
+      });
+  Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+  Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+  emit_op(e, target, src1, src2);
+  e.vucomisd(target, target);
+  e.jp(invalid, X64Emitter::T_NEAR);
+  if (aliased) {
+    e.vmovapd(i.dest, e.xmm2);
+  }
+  BindNanExit(e, done, i.dest.reg());
+}
+
+// ============================================================================
+// OPCODE_ADD
+// ============================================================================
+// TODO(benvanik): put dest/src1|2 together.
+template <typename SEQ, typename REG, typename ARGS>
+void EmitAddXX(X64Emitter& e, const ARGS& i) {
+  SEQ::EmitCommutativeBinaryOp(
+      e, i,
+      [](X64Emitter& e, const REG& dest_src, const REG& src) {
+        e.add(dest_src, src);
+      },
+      [](X64Emitter& e, const REG& dest_src, int32_t constant) {
+        if (constant == 1 && e.IsFeatureEnabled(kX64FlagsIndependentVars)) {
+          e.inc(dest_src);
+        } else {
+          e.add(dest_src, constant);
+        }
+      });
+}
+struct ADD_I8 : Sequence<ADD_I8, I<OPCODE_ADD, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitAddXX<ADD_I8, Reg8>(e, i);
+  }
+};
+struct ADD_I16 : Sequence<ADD_I16, I<OPCODE_ADD, I16Op, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitAddXX<ADD_I16, Reg16>(e, i);
+  }
+};
+struct ADD_I32 : Sequence<ADD_I32, I<OPCODE_ADD, I32Op, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitAddXX<ADD_I32, Reg32>(e, i);
+  }
+};
+struct ADD_I64 : Sequence<ADD_I64, I<OPCODE_ADD, I64Op, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitAddXX<ADD_I64, Reg64>(e, i);
+  }
+};
+struct ADD_F32 : Sequence<ADD_F32, I<OPCODE_ADD, F32Op, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+    e.vaddss(i.dest, src1, src2);
+  }
+};
+struct ADD_F64 : Sequence<ADD_F64, I<OPCODE_ADD, F64Op, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    FuseToSingleIfNext(e, i.instr);
+    Xbyak::Label* range_done = EmitSingleRangeCheck<2>(e, i);
+    EmitBinaryFpWithPpcDefaultNan_F64(
+        e, i, [](X64Emitter& e, const Xmm& dest, const Xmm& s1, const Xmm& s2) {
+          e.vaddsd(dest, s1, s2);
+        });
+    if (range_done) {
+      BindNanExit(e, *range_done, i.dest.reg());
+    }
+  }
+};
+struct ADD_V128 : Sequence<ADD_V128, I<OPCODE_ADD, V128Op, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Vmx);
+
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+    e.vaddps(i.dest, src1, src2);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_ADD, ADD_I8, ADD_I16, ADD_I32, ADD_I64, ADD_F32,
+                     ADD_F64, ADD_V128);
+
+// ============================================================================
+// OPCODE_ADD_CARRY
+// ============================================================================
+// TODO(benvanik): put dest/src1|2 together.
+template <typename SEQ, typename REG, typename ARGS>
+void EmitAddCarryXX(X64Emitter& e, const ARGS& i) {
+  // TODO(benvanik): faster setting? we could probably do some fun math tricks
+  // here to get the carry flag set.
+  if (i.src3.is_constant) {
+    if (i.src3.constant()) {
+      e.stc();
+    } else {
+      e.clc();
+    }
+  } else {
+    e.bt(i.src3.reg().cvt32(), 0);
+  }
+  SEQ::EmitCommutativeBinaryOp(
+      e, i,
+      [](X64Emitter& e, const REG& dest_src, const REG& src) {
+        e.adc(dest_src, src);
+      },
+      [](X64Emitter& e, const REG& dest_src, int32_t constant) {
+        e.adc(dest_src, constant);
+      });
+}
+struct ADD_CARRY_I8
+    : Sequence<ADD_CARRY_I8, I<OPCODE_ADD_CARRY, I8Op, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitAddCarryXX<ADD_CARRY_I8, Reg8>(e, i);
+  }
+};
+struct ADD_CARRY_I16
+    : Sequence<ADD_CARRY_I16, I<OPCODE_ADD_CARRY, I16Op, I16Op, I16Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitAddCarryXX<ADD_CARRY_I16, Reg16>(e, i);
+  }
+};
+struct ADD_CARRY_I32
+    : Sequence<ADD_CARRY_I32, I<OPCODE_ADD_CARRY, I32Op, I32Op, I32Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitAddCarryXX<ADD_CARRY_I32, Reg32>(e, i);
+  }
+};
+struct ADD_CARRY_I64
+    : Sequence<ADD_CARRY_I64, I<OPCODE_ADD_CARRY, I64Op, I64Op, I64Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitAddCarryXX<ADD_CARRY_I64, Reg64>(e, i);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_ADD_CARRY, ADD_CARRY_I8, ADD_CARRY_I16,
+                     ADD_CARRY_I32, ADD_CARRY_I64);
+
+// ============================================================================
+// OPCODE_SUB
+// ============================================================================
+// TODO(benvanik): put dest/src1|2 together.
+template <typename SEQ, typename REG, typename ARGS>
+void EmitSubXX(X64Emitter& e, const ARGS& i) {
+  SEQ::EmitAssociativeBinaryOp(
+      e, i,
+      [](X64Emitter& e, const REG& dest_src, const REG& src) {
+        e.sub(dest_src, src);
+      },
+      [](X64Emitter& e, const REG& dest_src, int32_t constant) {
+        if (constant == 1 && e.IsFeatureEnabled(kX64FlagsIndependentVars)) {
+          e.dec(dest_src);
+        } else {
+          e.sub(dest_src, constant);
+        }
+      });
+}
+struct SUB_I8 : Sequence<SUB_I8, I<OPCODE_SUB, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitSubXX<SUB_I8, Reg8>(e, i);
+  }
+};
+struct SUB_I16 : Sequence<SUB_I16, I<OPCODE_SUB, I16Op, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitSubXX<SUB_I16, Reg16>(e, i);
+  }
+};
+struct SUB_I32 : Sequence<SUB_I32, I<OPCODE_SUB, I32Op, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitSubXX<SUB_I32, Reg32>(e, i);
+  }
+};
+struct SUB_I64 : Sequence<SUB_I64, I<OPCODE_SUB, I64Op, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitSubXX<SUB_I64, Reg64>(e, i);
+  }
+};
+struct SUB_F32 : Sequence<SUB_F32, I<OPCODE_SUB, F32Op, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_true(!i.instr->flags);
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+    e.vsubss(i.dest, src1, src2);
+  }
+};
+struct SUB_F64 : Sequence<SUB_F64, I<OPCODE_SUB, F64Op, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_true(!(i.instr->flags & ~ARITHMETIC_SINGLE_RANGE));
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    FuseToSingleIfNext(e, i.instr);
+    Xbyak::Label* range_done = EmitSingleRangeCheck<2>(e, i);
+    EmitBinaryFpWithPpcDefaultNan_F64(
+        e, i, [](X64Emitter& e, const Xmm& dest, const Xmm& s1, const Xmm& s2) {
+          e.vsubsd(dest, s1, s2);
+        });
+    if (range_done) {
+      BindNanExit(e, *range_done, i.dest.reg());
+    }
+  }
+};
+struct SUB_V128 : Sequence<SUB_V128, I<OPCODE_SUB, V128Op, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_true(!i.instr->flags);
+    e.ChangeMxcsrMode(MXCSRMode::Vmx);
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+    e.vsubps(i.dest, src1, src2);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_SUB, SUB_I8, SUB_I16, SUB_I32, SUB_I64, SUB_F32,
+                     SUB_F64, SUB_V128);
+
+// ============================================================================
+// OPCODE_MUL
+// ============================================================================
+// Sign doesn't matter here, as we don't use the high bits.
+// We exploit mulx here to avoid creating too much register pressure.
+struct MUL_I8 : Sequence<MUL_I8, I<OPCODE_MUL, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(MUL_I8);
+  }
+};
+struct MUL_I16 : Sequence<MUL_I16, I<OPCODE_MUL, I16Op, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(MUL_I8);
+  }
+};
+struct MUL_I32 : Sequence<MUL_I32, I<OPCODE_MUL, I32Op, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (i.src2.is_constant) {
+      uint32_t multiplier = i.src2.value->constant.u32;
+      if (multiplier == 3 || multiplier == 5 || multiplier == 9) {
+        e.lea(i.dest, e.ptr[i.src1.reg() * (multiplier - 1) + i.src1.reg()]);
+        return;
+      }
+    }
+
+    if (e.IsFeatureEnabled(kX64EmitBMI2)) {
+      // mulx: $1:$2 = EDX * $3
+
+      // TODO(benvanik): place src2 in edx?
+      if (i.src1.is_constant) {
+        assert_true(!i.src2.is_constant);
+        e.mov(e.edx, i.src2);
+        e.mov(e.eax, i.src1.constant());
+        e.mulx(e.edx, i.dest, e.eax);
+      } else if (i.src2.is_constant) {
+        e.mov(e.edx, i.src1);
+        e.mov(e.eax, i.src2.constant());
+        e.mulx(e.edx, i.dest, e.eax);
+      } else {
+        e.mov(e.edx, i.src2);
+        e.mulx(e.edx, i.dest, i.src1);
+      }
+    } else {
+      // x86 mul instruction
+      // EDX:EAX = EAX * $1;
+
+      // is_constant AKA not a register
+      if (i.src1.is_constant) {
+        assert_true(!i.src2.is_constant);  // can't multiply 2 constants
+        e.mov(e.eax, i.src1.constant());
+        e.mul(i.src2);
+        e.mov(i.dest, e.eax);
+      } else if (i.src2.is_constant) {
+        assert_true(!i.src1.is_constant);  // can't multiply 2 constants
+        e.mov(e.eax, i.src2.constant());
+        e.mul(i.src1);
+        e.mov(i.dest, e.eax);
+      } else {
+        e.mov(e.eax, i.src1);
+        e.mul(i.src2);
+        e.mov(i.dest, e.eax);
+      }
+    }
+  }
+};
+struct MUL_I64 : Sequence<MUL_I64, I<OPCODE_MUL, I64Op, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (i.src2.is_constant) {
+      uint64_t multiplier = i.src2.value->constant.u64;
+      if (multiplier == 3 || multiplier == 5 || multiplier == 9) {
+        e.lea(i.dest,
+              e.ptr[i.src1.reg() * ((int)multiplier - 1) + i.src1.reg()]);
+        return;
+      }
+    }
+
+    if (e.IsFeatureEnabled(kX64EmitBMI2)) {
+      // mulx: $1:$2 = RDX * $3
+
+      // TODO(benvanik): place src2 in edx?
+      if (i.src1.is_constant) {
+        assert_true(!i.src2.is_constant);
+        e.mov(e.rdx, i.src2);
+        e.mov(e.rax, i.src1.constant());
+        e.mulx(e.rdx, i.dest, e.rax);
+      } else if (i.src2.is_constant) {
+        e.mov(e.rdx, i.src1);
+        e.mov(e.rax, i.src2.constant());
+        e.mulx(e.rdx, i.dest, e.rax);
+      } else {
+        e.mov(e.rdx, i.src2);
+        e.mulx(e.rdx, i.dest, i.src1);
+      }
+    } else {
+      // x86 mul instruction
+      // RDX:RAX = RAX * $1;
+
+      if (i.src1.is_constant) {
+        assert_true(!i.src2.is_constant);  // can't multiply 2 constants
+        e.mov(e.rax, i.src1.constant());
+        e.mul(i.src2);
+        e.mov(i.dest, e.rax);
+      } else if (i.src2.is_constant) {
+        assert_true(!i.src1.is_constant);  // can't multiply 2 constants
+        e.mov(e.rax, i.src2.constant());
+        e.mul(i.src1);
+        e.mov(i.dest, e.rax);
+      } else {
+        e.mov(e.rax, i.src1);
+        e.mul(i.src2);
+        e.mov(i.dest, e.rax);
+      }
+    }
+  }
+};
+struct MUL_F32 : Sequence<MUL_F32, I<OPCODE_MUL, F32Op, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_true(!i.instr->flags);
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+    e.vmulss(i.dest, src1, src2);
+  }
+};
+struct MUL_F64 : Sequence<MUL_F64, I<OPCODE_MUL, F64Op, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_true(!(i.instr->flags & ~ARITHMETIC_SINGLE_RANGE));
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    FuseToSingleIfNext(e, i.instr);
+    Xbyak::Label* range_done = EmitSingleRangeCheck<2>(e, i);
+    EmitBinaryFpWithPpcDefaultNan_F64(
+        e, i, [](X64Emitter& e, const Xmm& dest, const Xmm& s1, const Xmm& s2) {
+          e.vmulsd(dest, s1, s2);
+        });
+    if (range_done) {
+      BindNanExit(e, *range_done, i.dest.reg());
+    }
+  }
+};
+struct MUL_V128 : Sequence<MUL_V128, I<OPCODE_MUL, V128Op, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_true(!i.instr->flags);
+    e.ChangeMxcsrMode(MXCSRMode::Vmx);
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+    EmitVmxFloatBinOp(e, i.dest, src1, src2,
+                      [](X64Emitter& e, const Xmm& d, const Xmm& a,
+                         const Xmm& b) { e.vmulps(d, a, b); });
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_MUL, MUL_I8, MUL_I16, MUL_I32, MUL_I64, MUL_F32,
+                     MUL_F64, MUL_V128);
+
+// ============================================================================
+// OPCODE_MUL_HI
+// ============================================================================
+struct MUL_HI_I8 : Sequence<MUL_HI_I8, I<OPCODE_MUL_HI, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(MUL_HI_I8);
+  }
+};
+struct MUL_HI_I16
+    : Sequence<MUL_HI_I16, I<OPCODE_MUL_HI, I16Op, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(MUL_HI_I8);
+  }
+};
+struct MUL_HI_I32
+    : Sequence<MUL_HI_I32, I<OPCODE_MUL_HI, I32Op, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(MUL_HI_I32);
+  }
+};
+struct MUL_HI_I64
+    : Sequence<MUL_HI_I64, I<OPCODE_MUL_HI, I64Op, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (i.instr->flags & ARITHMETIC_UNSIGNED) {
+      if (e.IsFeatureEnabled(kX64EmitBMI2)) {
+        // TODO(benvanik): place src1 in eax? still need to sign extend
+        e.mov(e.rdx, i.src1);
+        if (i.src2.is_constant) {
+          e.mov(e.rax, i.src2.constant());
+          e.mulx(i.dest, e.rdx, e.rax);
+        } else {
+          e.mulx(i.dest, e.rax, i.src2);
+        }
+      } else {
+        // x86 mul instruction
+        // RDX:RAX < RAX * REG(op1);
+        if (i.src1.is_constant) {
+          assert_true(!i.src2.is_constant);  // can't multiply 2 constants
+          e.mov(e.rax, i.src1.constant());
+          e.mul(i.src2);
+          e.mov(i.dest, e.rdx);
+        } else if (i.src2.is_constant) {
+          assert_true(!i.src1.is_constant);  // can't multiply 2 constants
+          e.mov(e.rax, i.src2.constant());
+          e.mul(i.src1);
+          e.mov(i.dest, e.rdx);
+        } else {
+          e.mov(e.rax, i.src1);
+          e.mul(i.src2);
+          e.mov(i.dest, e.rdx);
+        }
+      }
+    } else {
+      if (i.src1.is_constant) {
+        e.mov(e.rax, i.src1.constant());
+      } else {
+        e.mov(e.rax, i.src1);
+      }
+      if (i.src2.is_constant) {
+        e.mov(e.rdx, i.src2.constant());
+        e.imul(e.rdx);
+      } else {
+        e.imul(i.src2);
+      }
+      e.mov(i.dest, e.rdx);
+    }
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_MUL_HI, MUL_HI_I8, MUL_HI_I16, MUL_HI_I32,
+                     MUL_HI_I64);
+
+// ============================================================================
+// OPCODE_DIV
+// ============================================================================
+// TODO(benvanik): optimize common constant cases.
+// TODO(benvanik): simplify code!
+struct DIV_I8 : Sequence<DIV_I8, I<OPCODE_DIV, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(DIV_I8);
+  }
+};
+struct DIV_I16 : Sequence<DIV_I16, I<OPCODE_DIV, I16Op, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(DIV_I16);
+  }
+};
+/*
+        TODO: hoist the overflow/zero checks into HIR
+*/
+struct DIV_I32 : Sequence<DIV_I32, I<OPCODE_DIV, I32Op, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    Xbyak::Label skip;
+    e.inLocalLabel();
+    e.xor_(e.eax,
+           e.eax);  // need to make sure that we're zeroed if its divide by zero
+    if (i.src2.is_constant) {
+      assert_true(!i.src1.is_constant);
+
+      if (i.instr->flags & ARITHMETIC_UNSIGNED) {
+        e.mov(e.ecx, i.src2.constant());
+        e.mov(e.eax, i.src1);
+        // Zero upper bits.
+        e.xor_(e.edx, e.edx);
+        e.div(e.ecx);
+      } else {
+        e.mov(e.ecx, i.src2.constant());
+        if (i.src2.constant() == -1) {  // we might have signed overflow, so
+                                        // check src1 for 0x80000000 at runtime
+          e.cmp(i.src1, 1);
+
+          e.jo(skip, CodeGenerator::T_SHORT);
+        }
+        e.mov(e.eax, i.src1);
+
+        e.cdq();  // edx:eax = sign-extend eax
+        e.idiv(e.ecx);
+      }
+
+    } else {
+      // Skip if src2 is zero.
+      e.test(i.src2, i.src2);
+      // branches are assumed not taken, so a newly executed divide instruction
+      // that divides by 0 will probably end up speculatively executing the
+      // divide instruction :/ hopefully no games rely on divide by zero
+      // behavior
+      e.jz(skip, CodeGenerator::T_SHORT);
+
+      if (i.instr->flags & ARITHMETIC_UNSIGNED) {
+        if (i.src1.is_constant) {
+          e.mov(e.eax, i.src1.constant());
+        } else {
+          e.mov(e.eax, i.src1);
+        }
+        // Zero upper bits.
+        e.xor_(e.edx, e.edx);
+        e.div(i.src2);
+      } else {
+        // check for signed overflow
+        if (i.src1.is_constant) {
+          if (i.src1.constant() != (1 << 31)) {
+            // we're good, overflow is impossible
+          } else {
+            e.cmp(i.src2, -1);  // otherwise, if src2 is -1 then we have
+                                // overflow
+            e.jz(skip, CodeGenerator::T_SHORT);
+          }
+        } else {
+          e.xor_(e.ecx, e.ecx);
+          e.cmp(i.src1, 1);  //== 0x80000000
+          e.seto(e.cl);
+          e.cmp(i.src2, -1);
+          e.setz(e.ch);
+          e.cmp(e.ecx, 0x0101);
+          e.jz(skip, CodeGenerator::T_SHORT);
+        }
+
+        if (i.src1.is_constant) {
+          e.mov(e.eax, i.src1.constant());
+        } else {
+          e.mov(e.eax, i.src1);
+        }
+
+        e.cdq();  // edx:eax = sign-extend eax
+        e.idiv(i.src2);
+      }
+    }
+
+    e.L(skip);
+    e.outLocalLabel();
+    e.mov(i.dest, e.eax);
+  }
+};
+/*
+        TODO: hoist the overflow/zero checks into HIR
+*/
+struct DIV_I64 : Sequence<DIV_I64, I<OPCODE_DIV, I64Op, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    Xbyak::Label skip;
+    e.inLocalLabel();
+    e.xor_(e.eax,
+           e.eax);  // need to make sure that we're zeroed if its divide by zero
+    if (i.src2.is_constant) {
+      assert_true(!i.src1.is_constant);
+
+      if (i.instr->flags & ARITHMETIC_UNSIGNED) {
+        e.mov(e.rcx, i.src2.constant());
+        e.mov(e.rax, i.src1);
+        // Zero upper bits.
+        e.xor_(e.edx, e.edx);
+        e.div(e.rcx);
+      } else {
+        if (i.src2.constant() ==
+            -1LL) {  // we might have signed overflow, so
+                     // check src1 for 0x80000000 at runtime
+          e.cmp(i.src1, 1);
+
+          e.jo(skip, CodeGenerator::T_SHORT);
+        }
+        e.mov(e.rcx, i.src2.constant());
+        e.mov(e.rax, i.src1);
+        e.cqo();  // rdx:rax = sign-extend rax
+        e.idiv(e.rcx);
+      }
+    } else {
+      // Skip if src2 is zero.
+      e.test(i.src2, i.src2);
+      e.jz(skip, CodeGenerator::T_SHORT);
+
+      if (i.instr->flags & ARITHMETIC_UNSIGNED) {
+        if (i.src1.is_constant) {
+          e.mov(e.rax, i.src1.constant());
+        } else {
+          e.mov(e.rax, i.src1);
+        }
+        // Zero upper bits.
+        e.xor_(e.edx, e.edx);
+        e.div(i.src2);
+      } else {
+        // check for signed overflow
+        if (i.src1.is_constant) {
+          if (i.src1.constant() != (1ll << 63)) {
+            // we're good, overflow is impossible
+          } else {
+            e.cmp(i.src2, -1);  // otherwise, if src2 is -1 then we have
+                                // overflow
+            e.jz(skip, CodeGenerator::T_SHORT);
+          }
+        } else {
+          e.xor_(e.ecx, e.ecx);
+          e.cmp(i.src1, 1);  //== 0x80000000
+          e.seto(e.cl);
+          e.cmp(i.src2, -1);
+          e.setz(e.ch);
+          e.cmp(e.ecx, 0x0101);
+          e.jz(skip, CodeGenerator::T_SHORT);
+        }
+
+        if (i.src1.is_constant) {
+          e.mov(e.rax, i.src1.constant());
+        } else {
+          e.mov(e.rax, i.src1);
+        }
+        e.cqo();  // rdx:rax = sign-extend rax
+        e.idiv(i.src2);
+      }
+    }
+
+    e.L(skip);
+    e.outLocalLabel();
+    e.mov(i.dest, e.rax);
+  }
+};
+struct DIV_F32 : Sequence<DIV_F32, I<OPCODE_DIV, F32Op, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_true(!i.instr->flags);
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+    e.vdivss(i.dest, src1, src2);
+  }
+};
+struct DIV_F64 : Sequence<DIV_F64, I<OPCODE_DIV, F64Op, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_true(!i.instr->flags);
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    FuseToSingleIfNext(e, i.instr);
+    EmitBinaryFpWithPpcDefaultNan_F64(
+        e, i, [](X64Emitter& e, const Xmm& dest, const Xmm& s1, const Xmm& s2) {
+          e.vdivsd(dest, s1, s2);
+        });
+  }
+};
+struct DIV_V128 : Sequence<DIV_V128, I<OPCODE_DIV, V128Op, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(DIV_V128);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_DIV, DIV_I8, DIV_I16, DIV_I32, DIV_I64, DIV_F32,
+                     DIV_F64, DIV_V128);
+
+// ============================================================================
+// OPCODE_MUL_ADD
+// ============================================================================
+// d = 1 * 2 + 3
+// $0 = $1x$0 + $2
+// Forms of vfmadd/vfmsub:
+// - 132 -> $1 = $1 * $3 + $2
+// - 213 -> $1 = $2 * $1 + $3
+// - 231 -> $1 = $2 * $3 + $1
+//
+// PPC multiply-add NaN semantics. Hardware returns the first NaN operand in
+// A, B, C order (the HIR operands are A, C, B, so the walk is src1, src3,
+// src2), quieted, rather than whatever the host FMA picked, and leaves its sign
+// alone even for the negated forms.
+//
+// Every scalar form takes the fixup; of the packed ones only the negated
+// vnmsubfp does. Putting it on vmaddfp as well costs ~8.5fps, and vmaddfp is
+// the only multiply-add hot enough to notice.
+//
+// The fixup is only reached when the result is already NaN, which covers every
+// case needing one: a NaN operand always yields a NaN result, and an invalid
+// operation with no NaN operand needs the PPC default rather than x86's.
+
+// Packed single. Branchless, since every lane may need a different answer. The
+// sources are stashed first so xmm0-2 can be clobbered even when they hold
+// materialized constants.
+static void EmitFmaPpcNanFixup_V128(X64Emitter& e, const Xmm& dest,
+                                    const Xmm& result, const Xmm& src1,
+                                    const Xmm& src2, const Xmm& src3) {
+  e.StashXmm(0, src1);
+  e.StashXmm(1, src2);
+  e.StashXmm(2, src3);
+  auto stash = [&e](int index) {
+    return e.ptr[e.rsp + X64Emitter::kStashOffset + index * 16];
+  };
+  // Lowest priority first, so an earlier operand overwrites a later one:
+  // src2 (C), then src3 (B), then src1 (A).
+  const int order[3] = {1, 2, 0};
+
+  e.vmovaps(e.xmm0, e.GetXmmConstPtr(XMMQNaN));
+  for (int step = 0; step < 3; ++step) {
+    e.vmovaps(e.xmm1, stash(order[step]));
+    e.vcmpunordps(e.xmm2, e.xmm1, e.xmm1);
+    e.vorps(e.xmm1, e.xmm1, e.GetXmmConstPtr(XMMQuietBit));
+    e.vblendvps(e.xmm0, e.xmm0, e.xmm1, e.xmm2);
+  }
+  // Lanes whose result is not NaN keep the arithmetic answer.
+  e.vcmpunordps(e.xmm2, result, result);
+  e.vblendvps(dest, result, e.xmm0, e.xmm2);
+}
+
+// Scalar double. One lane, so a branch chain beats the blend sequence.
+static void EmitFmaPpcNanFixup_F64(X64Emitter& e, const Xmm& dest,
+                                   const Xmm& src1, const Xmm& src2,
+                                   const Xmm& src3, Xbyak::Label& done) {
+  const Xmm order[3] = {src1, src3, src2};  // A, B, C
+  for (int step = 0; step < 3; ++step) {
+    Xbyak::Label not_nan;
+    e.vucomisd(order[step], order[step]);
+    e.jnp(not_nan);
+    e.vmovq(e.rax, order[step]);
+    e.mov(e.rdx, 1ull << 51);  // ensure quiet
+    e.or_(e.rax, e.rdx);
+    e.vmovq(dest, e.rax);
+    e.jmp(done, e.T_NEAR);
+    e.L(not_nan);
+  }
+  // No NaN operand, so this is an invalid operation.
+  e.mov(e.rax, 0x7FF8000000000000ull);
+  e.vmovq(dest, e.rax);
+  e.jmp(done, e.T_NEAR);
+}
+
+// Negates the arithmetic result in xmm3 when the opcode asks for it, then
+// routes a NaN result to the fixup.
+template <typename ARGS>
+static void EmitPpcFmaResult_F64(X64Emitter& e, const ARGS& i, bool negate) {
+  if (negate) {
+    // Not the vfnmadd/vfnmsub forms: those negate the operands, which differs
+    // from negating the result when the addends are zeros of opposite sign.
+    e.vxorps(e.xmm3, e.xmm3, e.GetXmmConstPtr(XMMSignMaskPD));
+  }
+  // Tail code is emitted at the end of the whole function, so the label has to
+  // outlive this sequence.
+  Xbyak::Label& done = e.NewCachedLabel();
+  Xbyak::Label& fixup =
+      e.AddToTail([&done, i](X64Emitter& e, Xbyak::Label& tail) {
+        e.L(tail);
+        Xmm s1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+        Xmm s2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+        Xmm s3 = GetInputRegOrConstant(e, i.src3, e.xmm2);
+        EmitFmaPpcNanFixup_F64(e, i.dest, s1, s2, s3, done);
+      });
+  e.vucomisd(e.xmm3, e.xmm3);
+  e.jp(fixup, e.T_NEAR);
+  e.vmovapd(i.dest, e.xmm3);
+  BindNanExit(e, done, i.dest.reg());
+}
+
+template <typename ARGS>
+static void EmitNegatedFma_V128(X64Emitter& e, const ARGS& i) {
+  e.vxorps(e.xmm3, e.xmm3, e.GetXmmConstPtr(XMMSignMaskPS));
+  Xbyak::Label& done = e.NewCachedLabel();
+  Xbyak::Label& fixup =
+      e.AddToTail([&done, i](X64Emitter& e, Xbyak::Label& tail) {
+        e.L(tail);
+        // Re-derive rather than capture: the hot path's NaN test clobbers
+        // xmm0, which is where a constant operand would have been placed.
+        Xmm s1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+        Xmm s2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+        Xmm s3 = GetInputRegOrConstant(e, i.src3, e.xmm2);
+        EmitFmaPpcNanFixup_V128(e, i.dest, e.xmm3, s1, s2, s3);
+        e.jmp(done, e.T_NEAR);
+      });
+  e.vcmpunordps(e.xmm0, e.xmm3, e.xmm3);
+  e.vptest(e.xmm0, e.xmm0);
+  e.jnz(fixup, e.T_NEAR);
+  e.vmovaps(i.dest, e.xmm3);
+  e.L(done);
+}
+
+struct MUL_ADD_F32
+    : Sequence<MUL_ADD_F32, I<OPCODE_MUL_ADD, F32Op, F32Op, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(
+        MUL_ADD_F32);  // this can never happen, there are very few actual
+                       // float32 instructions
+  }
+};
+struct MUL_ADD_F64
+    : Sequence<MUL_ADD_F64, I<OPCODE_MUL_ADD, F64Op, F64Op, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    FuseToSingleIfNext(e, i.instr);
+    Xbyak::Label* range_done = EmitSingleRangeCheck<3>(e, i);
+
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+    Xmm src3 = GetInputRegOrConstant(e, i.src3, e.xmm2);
+    if (e.IsFeatureEnabled(kX64EmitFMA)) {
+      // todo: this is garbage
+      e.vmovapd(e.xmm3, src1);
+      e.vfmadd213sd(e.xmm3, src2, src3);
+    } else {
+      // todo: might need to use x87 in this case...
+      e.vmulsd(e.xmm3, src1, src2);
+      e.vaddsd(e.xmm3, e.xmm3, src3);
+    }
+    EmitPpcFmaResult_F64(e, i,
+                         (i.instr->flags & ARITHMETIC_NEGATE_RESULT) != 0);
+    if (range_done) {
+      BindNanExit(e, *range_done, i.dest.reg());
+    }
+  }
+};
+struct MUL_ADD_V128
+    : Sequence<MUL_ADD_V128,
+               I<OPCODE_MUL_ADD, V128Op, V128Op, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(VmxDenormalFlushMode());
+
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+    Xmm src3 = GetInputRegOrConstant(e, i.src3, e.xmm2);
+    const bool negate = (i.instr->flags & ARITHMETIC_NEGATE_RESULT) != 0;
+    if (e.IsFeatureEnabled(kX64EmitFMA)) {
+      // todo: this is garbage
+      // 132 rather than 213, for free: the host ranks NaN operands
+      // multiplicand, multiplier, addend, so this form propagates A, C, B where
+      // 213 propagates C, A, B. PPC wants A, B, C.
+      if (!negate) {
+        // Which leaves B outranking C, and the host cannot express that: the
+        // addend is always ranked last. Zeroing the multiplier wherever the
+        // addend is a NaN makes the host fall through to it. Nothing else
+        // moves: a NaN addend means the result is a NaN from A or B whatever C
+        // held, and A still outranks both.
+        e.vcmpunordps(e.xmm3, src3, src3);
+        e.vandnps(e.xmm1, e.xmm3, src2);
+        src2 = e.xmm1;
+      }
+      e.vmovaps(e.xmm3, src1);
+      e.vfmadd132ps(e.xmm3, src3, src2);
+      if (!negate) {
+        e.vmovaps(i.dest, e.xmm3);
+      }
+    } else {
+      // todo: might need to use x87 in this case...
+      e.vmulps(e.xmm3, src1, src2);
+      if (negate) {
+        e.vaddps(e.xmm3, e.xmm3, src3);
+      } else {
+        e.vaddps(i.dest, e.xmm3, src3);
+      }
+    }
+    if (negate) {
+      EmitNegatedFma_V128(e, i);
+    }
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_MUL_ADD, MUL_ADD_F32, MUL_ADD_F64, MUL_ADD_V128);
+
+// ============================================================================
+// OPCODE_MUL_SUB
+// ============================================================================
+// d = 1 * 2 - 3
+// $0 = $2x$0 - $3
+// TODO(benvanik): use other forms (132/213/etc) to avoid register shuffling.
+// dest could be src2 or src3 - need to ensure it's not before overwriting dest
+// perhaps use other 132/213/etc
+// Forms:
+// - 132 -> $1 = $1 * $3 - $2
+// - 213 -> $1 = $2 * $1 - $3
+// - 231 -> $1 = $2 * $3 - $1
+
+struct MUL_SUB_F64
+    : Sequence<MUL_SUB_F64, I<OPCODE_MUL_SUB, F64Op, F64Op, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    FuseToSingleIfNext(e, i.instr);
+    Xbyak::Label* range_done = EmitSingleRangeCheck<3>(e, i);
+
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+    Xmm src3 = GetInputRegOrConstant(e, i.src3, e.xmm2);
+    if (e.IsFeatureEnabled(kX64EmitFMA)) {
+      // todo: this is garbage
+      e.vmovapd(e.xmm3, src1);
+      e.vfmsub213sd(e.xmm3, src2, src3);
+    } else {
+      // todo: might need to use x87 in this case...
+      e.vmulsd(e.xmm3, src1, src2);
+      e.vsubsd(e.xmm3, e.xmm3, src3);
+    }
+    EmitPpcFmaResult_F64(e, i,
+                         (i.instr->flags & ARITHMETIC_NEGATE_RESULT) != 0);
+    if (range_done) {
+      BindNanExit(e, *range_done, i.dest.reg());
+    }
+  }
+};
+struct MUL_SUB_V128
+    : Sequence<MUL_SUB_V128,
+               I<OPCODE_MUL_SUB, V128Op, V128Op, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(VmxDenormalFlushMode());
+
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+    Xmm src3 = GetInputRegOrConstant(e, i.src3, e.xmm2);
+    const bool negate = (i.instr->flags & ARITHMETIC_NEGATE_RESULT) != 0;
+    if (e.IsFeatureEnabled(kX64EmitFMA)) {
+      // todo: this is garbage
+      e.vmovaps(e.xmm3, src1);
+      e.vfmsub213ps(e.xmm3, src2, src3);
+      if (!negate) {
+        e.vmovaps(i.dest, e.xmm3);
+      }
+    } else {
+      // todo: might need to use x87 in this case...
+      e.vmulps(e.xmm3, src1, src2);
+      if (negate) {
+        e.vsubps(e.xmm3, e.xmm3, src3);
+      } else {
+        e.vsubps(i.dest, e.xmm3, src3);
+      }
+    }
+    if (negate) {
+      EmitNegatedFma_V128(e, i);
+    }
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_MUL_SUB, MUL_SUB_F64, MUL_SUB_V128);
+
+// ============================================================================
+// OPCODE_NEG
+// ============================================================================
+// TODO(benvanik): put dest/src1 together.
+template <typename SEQ, typename REG, typename ARGS>
+void EmitNegXX(X64Emitter& e, const ARGS& i) {
+  SEQ::EmitUnaryOp(e, i,
+                   [](X64Emitter& e, const REG& dest_src) { e.neg(dest_src); });
+}
+struct NEG_I8 : Sequence<NEG_I8, I<OPCODE_NEG, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitNegXX<NEG_I8, Reg8>(e, i);
+  }
+};
+struct NEG_I16 : Sequence<NEG_I16, I<OPCODE_NEG, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitNegXX<NEG_I16, Reg16>(e, i);
+  }
+};
+struct NEG_I32 : Sequence<NEG_I32, I<OPCODE_NEG, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitNegXX<NEG_I32, Reg32>(e, i);
+  }
+};
+struct NEG_I64 : Sequence<NEG_I64, I<OPCODE_NEG, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitNegXX<NEG_I64, Reg64>(e, i);
+  }
+};
+struct NEG_F32 : Sequence<NEG_F32, I<OPCODE_NEG, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    e.vxorps(i.dest, i.src1, e.GetXmmConstPtr(XMMSignMaskPS));
+  }
+};
+struct NEG_F64 : Sequence<NEG_F64, I<OPCODE_NEG, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    e.vxorpd(i.dest, i.src1, e.GetXmmConstPtr(XMMSignMaskPD));
+  }
+};
+struct NEG_V128 : Sequence<NEG_V128, I<OPCODE_NEG, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_true(!i.instr->flags);
+    e.ChangeMxcsrMode(MXCSRMode::Vmx);
+    e.vxorps(i.dest, i.src1, e.GetXmmConstPtr(XMMSignMaskPS));
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_NEG, NEG_I8, NEG_I16, NEG_I32, NEG_I64, NEG_F32,
+                     NEG_F64, NEG_V128);
+
+// ============================================================================
+// OPCODE_ABS
+// ============================================================================
+struct ABS_F32 : Sequence<ABS_F32, I<OPCODE_ABS, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    e.vandps(i.dest, i.src1, e.GetXmmConstPtr(XMMAbsMaskPS));
+  }
+};
+struct ABS_F64 : Sequence<ABS_F64, I<OPCODE_ABS, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    e.vandpd(i.dest, i.src1, e.GetXmmConstPtr(XMMAbsMaskPD));
+  }
+};
+struct ABS_V128 : Sequence<ABS_V128, I<OPCODE_ABS, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Vmx);
+    e.vandps(i.dest, i.src1, e.GetXmmConstPtr(XMMAbsMaskPS));
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_ABS, ABS_F32, ABS_F64, ABS_V128);
+
+// ============================================================================
+// OPCODE_SQRT
+// ============================================================================
+struct SQRT_F32 : Sequence<SQRT_F32, I<OPCODE_SQRT, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    e.vsqrtss(i.dest, src1, src1);
+  }
+};
+struct SQRT_F64 : Sequence<SQRT_F64, I<OPCODE_SQRT, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    FuseToSingleIfNext(e, i.instr);
+    Xmm src = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    // A negative operand is an invalid operation, and PPC answers it with the
+    // positive default QNaN where x86 answers with the negative one. Only a NaN
+    // result can need the fixup, so the test stays off the result's dependency
+    // chain. The sqrt lands in a scratch because dest may share a register with
+    // src, and the tail still needs the operand to tell the two NaNs apart.
+    Xbyak::Label& done = e.NewCachedLabel();
+    Xbyak::Label& invalid =
+        e.AddToTail([i, &done](X64Emitter& e, Xbyak::Label& tail) {
+          e.L(tail);
+          Xbyak::Label propagate;
+          Xmm src = GetInputRegOrConstant(e, i.src1, e.xmm0);
+          e.vucomisd(src, src);
+          e.jp(propagate);  // NaN operand: keep the one sqrtsd propagated
+          e.mov(e.rax, 0x7FF8000000000000ull);
+          e.vmovq(i.dest, e.rax);
+          e.jmp(done, X64Emitter::T_NEAR);
+          e.L(propagate);
+          e.vmovapd(i.dest, e.xmm1);
+          e.jmp(done, X64Emitter::T_NEAR);
+        });
+    e.vsqrtsd(e.xmm1, src, src);
+    e.vucomisd(e.xmm1, e.xmm1);
+    e.jp(invalid, X64Emitter::T_NEAR);
+    e.vmovapd(i.dest, e.xmm1);
+    BindNanExit(e, done, i.dest.reg());
+  }
+};
+struct SQRT_V128 : Sequence<SQRT_V128, I<OPCODE_SQRT, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Vmx);
+    e.vsqrtps(i.dest, GetInputRegOrConstant(e, i.src1, e.xmm0));
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_SQRT, SQRT_F32, SQRT_F64, SQRT_V128);
+
+// ============================================================================
+// OPCODE_RSQRT
+// ============================================================================
+// Altivec guarantees an error of < 1/4096 for vrsqrtefp while AVX only gives
+// < 1.5*2^-12 ≈ 1/2730 for vrsqrtps.
+struct RSQRT_F32 : Sequence<RSQRT_F32, I<OPCODE_RSQRT, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
+
+    if (e.IsFeatureEnabled(kX64EmitAVX512Ortho)) {
+      e.vrsqrt14ss(i.dest, src1, src1);
+    } else {
+      e.vmovaps(e.xmm0, e.GetXmmConstPtr(XMMOne));
+      e.vsqrtss(e.xmm1, src1, src1);
+      e.vdivss(i.dest, e.xmm0, e.xmm1);
+    }
+  }
+};
+struct RSQRT_F64 : Sequence<RSQRT_F64, I<OPCODE_RSQRT, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
+    e.vmovsd(e.xmm0, src1);
+    e.call(e.backend()->frsqrtefp_helper);
+    e.vmovsd(i.dest, e.xmm0);
+  }
+};
+struct RSQRT_V128 : Sequence<RSQRT_V128, I<OPCODE_RSQRT, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Vmx);
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
+    /*
+        the vast majority of inputs to vrsqrte come from vmsum3 or vmsum4 as
+       part of a vector normalization sequence. in fact, its difficult to find
+       uses of vrsqrte in titles that have inputs which do not come from vmsum.
+    */
+    if (i.src1.value && i.src1.value->AllFloatVectorLanesSameValue()) {
+      e.vmovss(e.xmm0, src1);
+      e.call(e.backend()->vrsqrtefp_scalar_helper);
+      e.vshufps(i.dest, e.xmm0, e.xmm0, 0);
+    } else {
+      e.vmovaps(e.xmm0, src1);
+      e.call(e.backend()->vrsqrtefp_vector_helper);
+      e.vmovaps(i.dest, e.xmm0);
+    }
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_RSQRT, RSQRT_F32, RSQRT_F64, RSQRT_V128);
+
+// The estimate instructions as the console computes them, one lane at a time
+template <uint32_t (*Estimate)(uint32_t)>
+static __m128 EmulateEstimate(void*, __m128 src) {
+  alignas(16) uint32_t values[4];
+  _mm_store_si128(reinterpret_cast<__m128i*>(values), _mm_castps_si128(src));
+  for (size_t i = 0; i < 4; ++i) {
+    values[i] = Estimate(values[i]);
+  }
+  return _mm_castsi128_ps(
+      _mm_load_si128(reinterpret_cast<const __m128i*>(values)));
+}
+
+template <typename EmitArgType>
+static void EmitEstimateCall(X64Emitter& e, const EmitArgType& i,
+                             void* emulate) {
+  Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
+#if XE_PLATFORM_WIN32
+  // Windows x64 ABI: __m128 is passed by implicit pointer
+  e.lea(e.GetNativeParam(0), e.StashXmm(0, src1));
+#else
+  // Linux/Mac System V ABI: __m128 passed in xmm0, return in xmm0
+  e.vmovaps(e.xmm0, src1);
+#endif
+  e.CallNativeSafe(emulate);
+  e.vmovaps(i.dest, e.xmm0);
+}
+
+// ============================================================================
+// OPCODE_RECIP
+// ============================================================================
+// vrefp and fres compute the console's own estimates, bit for bit. Host
+// estimates aren't close enough: rcpps (< 1.5*2^-12 error, where Altivec
+// guarantees < 1/4096) broke camp, horse and random event spawning, cactus
+// collision and grass in 5454082B, and AVX512's vrcp14ps differs as well.
+// Exact division doesn't match the console either.
+struct RECIP_F32 : Sequence<RECIP_F32, I<OPCODE_RECIP, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
+    // Note: AVX512's vrcp14ss has precision issues
+    // For now, always use division which gives exact results
+    e.vmovaps(e.xmm0, e.GetXmmConstPtr(XMMOne));
+    e.vdivss(i.dest, e.xmm0, src1);
+  }
+};
+// fres's result mantissas, for the top 7 input mantissa bits: those of
+// ppc::EstimateReciprocalSingle over [1, 2)
+struct FresTable {
+  uint64_t mantissas[128];
+
+  FresTable() {
+    for (uint32_t i = 0; i < 128; ++i) {
+      double result = ppc::EstimateReciprocalSingle(1.0 + i / 128.0);
+      uint64_t bits;
+      std::memcpy(&bits, &result, sizeof(bits));
+      mantissas[i] = bits & 0x000FFFFFFFFFFFFFull;
+    }
+  }
+};
+static const FresTable fres_table;
+
+// fres. While the result is a normal single (an input exponent from 895 to
+// 1148), it's exact: its mantissa comes from the table, and its exponent is
+// 2045 less the input's. Anything else (denormal and overflowing results,
+// zero, infinity, NaNs and denormal inputs) calls
+// ppc::EstimateReciprocalSingle.
+struct RECIP_F64 : Sequence<RECIP_F64, I<OPCODE_RECIP, F64Op, F64Op>> {
+  static __m128 EmulateFres(void*, __m128 src) {
+    return _mm_castpd_ps(_mm_set_sd(
+        ppc::EstimateReciprocalSingle(_mm_cvtsd_f64(_mm_castps_pd(src)))));
+  }
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    Xbyak::Label& done = e.NewCachedLabel();
+    Xbyak::Label& call =
+        e.AddToTail([i, &done](X64Emitter& e, Xbyak::Label& call) {
+          e.L(call);
+          EmitEstimateCall(e, i, reinterpret_cast<void*>(EmulateFres));
+          e.jmp(done, X64Emitter::T_NEAR);
+        });
+
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
+    e.vmovq(e.rax, src1);
+    e.mov(e.rcx, e.rax);
+    e.shr(e.rcx, 52);
+    e.and_(e.ecx, 0x7FF);
+    e.lea(e.edx, e.ptr[e.rcx - 895]);
+    e.cmp(e.edx, 1148 - 895);
+    e.ja(call, X64Emitter::T_NEAR);
+
+    // Sign | (2045 - exponent) << 52 | the table's mantissa
+    e.mov(e.rdx, e.rax);
+    e.shr(e.rdx, 45);
+    e.and_(e.edx, 0x7F);
+    e.neg(e.rcx);
+    e.add(e.rcx, 2045);
+    e.shl(e.rcx, 52);
+    e.shr(e.rax, 63);
+    e.shl(e.rax, 63);
+    e.or_(e.rax, e.rcx);
+    e.mov(e.rcx, reinterpret_cast<uintptr_t>(fres_table.mantissas));
+    e.or_(e.rax, e.qword[e.rcx + e.rdx * 8]);
+    e.vmovq(i.dest, e.rax);
+    e.L(done);
+  }
+};
+// vrefp, as ppc::EstimateReciprocal: the top 5 mantissa bits pick a segment,
+// and the result mantissa is its base minus its slope times the next 9 bits
+struct RECIP_V128 : Sequence<RECIP_V128, I<OPCODE_RECIP, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Vmx);
+    if (!e.IsFeatureEnabled(kX64EmitAVX2)) {
+      EmitEstimateCall(
+          e, i,
+          reinterpret_cast<void*>(EmulateEstimate<ppc::EstimateReciprocal>));
+      return;
+    }
+
+    // The input stays in xmm3, since the result may share its register
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
+    if (src1.getIdx() != e.xmm3.getIdx()) {
+      e.vmovdqa(e.xmm3, src1);
+    }
+
+    // Each table entry is the segment's base >> 9 above its slope
+    e.lea(e.rax, e.GetXmmConstPtr(XMMVRefpTable));
+    e.vpsrld(e.xmm0, e.xmm3, 18);
+    e.vpand(e.xmm0, e.xmm0, e.GetXmmConstPtr(XMMShiftMaskPS));
+    e.vpcmpeqd(e.xmm2, e.xmm2, e.xmm2);
+    e.vpgatherdd(e.xmm1, e.ptr[e.rax + e.xmm0 * 4], e.xmm2);
+
+    // Mantissa: base - slope * step
+    e.vpsrld(e.xmm2, e.xmm3, 9);
+    e.vpand(e.xmm2, e.xmm2, e.GetXmmConstPtr(XMMVRefpStepMask));
+    e.vpand(e.xmm0, e.xmm1, e.GetXmmConstPtr(XMMVRefpSlopeMask));
+    e.vpmulld(e.xmm0, e.xmm0, e.xmm2);
+    e.vpsrld(e.xmm1, e.xmm1, 16);
+    e.vpslld(e.xmm1, e.xmm1, 9);
+    e.vpsubd(e.xmm1, e.xmm1, e.xmm0);
+    e.vpand(e.xmm1, e.xmm1, e.GetXmmConstPtr(XMMVRefpMantissaMask));
+
+    // Exponent: 253 - the input's
+    e.vpand(e.xmm0, e.xmm3, e.GetXmmConstPtr(XMMFloatInf));
+    e.vmovdqa(e.xmm2, e.GetXmmConstPtr(XMMVRefpExponentBias));
+    e.vpsubd(e.xmm0, e.xmm2, e.xmm0);
+    e.vpor(e.xmm1, e.xmm1, e.xmm0);
+    e.vpand(e.xmm0, e.xmm3, e.GetXmmConstPtr(XMMSignMaskPS));
+    e.vpor(i.dest, e.xmm1, e.xmm0);
+
+    // Too large an input (and infinity) gives a signed zero, zero and
+    // denormals a signed infinity, and a NaN comes back quiet
+    e.vpand(e.xmm1, e.xmm3, e.GetXmmConstPtr(XMMAbsMaskPS));
+    e.vpcmpgtd(e.xmm2, e.xmm1, e.GetXmmConstPtr(XMMVRefpLargeLimit));
+    e.vpblendvb(i.dest, i.dest, e.xmm0, e.xmm2);
+    e.vmovdqa(e.xmm2, e.GetXmmConstPtr(XMMVRefpSmallestNormal));
+    e.vpcmpgtd(e.xmm2, e.xmm2, e.xmm1);
+    e.vpor(e.xmm0, e.xmm0, e.GetXmmConstPtr(XMMFloatInf));
+    e.vpblendvb(i.dest, i.dest, e.xmm0, e.xmm2);
+    e.vpcmpgtd(e.xmm2, e.xmm1, e.GetXmmConstPtr(XMMFloatInf));
+    e.vpor(e.xmm0, e.xmm3, e.GetXmmConstPtr(XMMQuietBit));
+    e.vpblendvb(i.dest, i.dest, e.xmm0, e.xmm2);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_RECIP, RECIP_F32, RECIP_F64, RECIP_V128);
+
+// ============================================================================
+// OPCODE_POW2
+// ============================================================================
+struct POW2_F32 : Sequence<POW2_F32, I<OPCODE_POW2, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(POW2_F32);
+  }
+};
+struct POW2_F64 : Sequence<POW2_F64, I<OPCODE_POW2, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(POW2_F64);
+  }
+};
+// The vexptefp and vlogefp tables in 2048ths, as 32-bit entries for
+// vpgatherdd, read back from ppc_estimates.cc: vexptefp of i/2048 and vlogefp
+// of 1 + i/2048
+struct EstimateTables {
+  uint32_t pow2[2048];
+  uint32_t log2[2048];
+
+  EstimateTables() {
+    for (uint32_t i = 0; i < 2048; ++i) {
+      float input = i / 2048.0f;
+      uint32_t input_bits;
+      std::memcpy(&input_bits, &input, sizeof(input_bits));
+      uint32_t result_bits = ppc::EstimatePow2(input_bits);
+      float result;
+      std::memcpy(&result, &result_bits, sizeof(result));
+      pow2[i] = static_cast<uint32_t>(result * 2048.0f);
+
+      result_bits = ppc::EstimateLog2(0x3F800000 | (i << 12));
+      std::memcpy(&result, &result_bits, sizeof(result));
+      log2[i] = static_cast<uint32_t>(result * 2048.0f);
+    }
+  }
+};
+static const EstimateTables estimate_tables;
+
+// vexptefp, as ppc::EstimatePow2: the input as fixed point with 11 fraction
+// bits, floored, whose integer part is the result's exponent and whose
+// fraction indexes the table
+struct POW2_V128 : Sequence<POW2_V128, I<OPCODE_POW2, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Vmx);
+    if (!e.IsFeatureEnabled(kX64EmitAVX2)) {
+      EmitEstimateCall(
+          e, i, reinterpret_cast<void*>(EmulateEstimate<ppc::EstimatePow2>));
+      return;
+    }
+
+    // The input stays in xmm3, since the result may share its register
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
+    if (src1.getIdx() != e.xmm3.getIdx()) {
+      e.vmovdqa(e.xmm3, src1);
+    }
+
+    // Truncated to 15 fraction bits: the mantissa with its implicit bit,
+    // shifted right by 135 - the exponent (32 or more gives 0), then negated
+    // for a negative input
+    e.vpsrld(e.xmm0, e.xmm3, 23);
+    e.vpand(e.xmm0, e.xmm0, e.GetXmmConstPtr(XMMEstimateExponentMask));
+    e.vmovdqa(e.xmm1, e.GetXmmConstPtr(XMMVExpteShiftBase));
+    e.vpsubd(e.xmm1, e.xmm1, e.xmm0);
+    e.vpand(e.xmm2, e.xmm3, e.GetXmmConstPtr(XMMVRefpMantissaMask));
+    e.vpor(e.xmm2, e.xmm2, e.GetXmmConstPtr(XMMVRefpSmallestNormal));
+    e.vpsrlvd(e.xmm2, e.xmm2, e.xmm1);
+    e.vpsrad(e.xmm1, e.xmm3, 31);
+    e.vpxor(e.xmm2, e.xmm2, e.xmm1);
+    e.vpsubd(e.xmm2, e.xmm2, e.xmm1);
+
+    // Floored to 11 fraction bits, which index the table
+    e.vpsrad(e.xmm2, e.xmm2, 4);
+    e.vpand(e.xmm0, e.xmm2, e.GetXmmConstPtr(XMMEstimateIndexMask));
+    e.vpsrad(e.xmm2, e.xmm2, 11);
+    e.mov(e.rax, reinterpret_cast<uintptr_t>(estimate_tables.pow2));
+    e.vpcmpeqd(e.xmm1, e.xmm1, e.xmm1);
+    e.vpgatherdd(i.dest, e.ptr[e.rax + e.xmm0 * 4], e.xmm1);
+
+    // The table entry has the implicit bit at bit 11, so it carries into the
+    // exponent: (integer + 126) << 23 plus the entry << 12
+    e.vmovdqa(e.xmm1, e.GetXmmConstPtr(XMMVExpteSmallestExponent));
+    e.vpcmpgtd(e.xmm1, e.xmm1, e.xmm2);
+    e.vpaddd(e.xmm2, e.xmm2, e.GetXmmConstPtr(XMMVExpteExponentBias));
+    e.vpslld(e.xmm2, e.xmm2, 23);
+    e.vpslld(i.dest, i.dest, 12);
+    e.vpaddd(i.dest, i.dest, e.xmm2);
+
+    // An integer part below -126 gives zero, an input from 128 up (and
+    // infinity) gives infinity, or zero if negative, and a NaN comes back
+    // quiet
+    e.vpandn(i.dest, e.xmm1, i.dest);
+    e.vpsrld(e.xmm0, e.xmm3, 23);
+    e.vpand(e.xmm0, e.xmm0, e.GetXmmConstPtr(XMMEstimateExponentMask));
+    e.vpcmpgtd(e.xmm0, e.xmm0, e.GetXmmConstPtr(XMMVExpteLargestInputExponent));
+    e.vpsrad(e.xmm1, e.xmm3, 31);
+    e.vpandn(e.xmm1, e.xmm1, e.GetXmmConstPtr(XMMFloatInf));
+    e.vpblendvb(i.dest, i.dest, e.xmm1, e.xmm0);
+    e.vpand(e.xmm1, e.xmm3, e.GetXmmConstPtr(XMMAbsMaskPS));
+    e.vpcmpgtd(e.xmm1, e.xmm1, e.GetXmmConstPtr(XMMFloatInf));
+    e.vpor(e.xmm0, e.xmm3, e.GetXmmConstPtr(XMMQuietBit));
+    e.vpblendvb(i.dest, i.dest, e.xmm0, e.xmm1);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_POW2, POW2_F32, POW2_F64, POW2_V128);
+
+// ============================================================================
+// OPCODE_LOG2
+// ============================================================================
+struct LOG2_F32 : Sequence<LOG2_F32, I<OPCODE_LOG2, F32Op, F32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(LOG2_F32);
+  }
+};
+struct LOG2_F64 : Sequence<LOG2_F64, I<OPCODE_LOG2, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(LOG2_F64);
+  }
+};
+// vlogefp, as ppc::EstimateLog2: the exponent less 127, plus the table entry
+// for the top 11 mantissa bits, in 2048ths
+struct LOG2_V128 : Sequence<LOG2_V128, I<OPCODE_LOG2, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Vmx);
+    if (!e.IsFeatureEnabled(kX64EmitAVX2)) {
+      EmitEstimateCall(
+          e, i, reinterpret_cast<void*>(EmulateEstimate<ppc::EstimateLog2>));
+      return;
+    }
+
+    // The input stays in xmm3, since the result may share its register
+    Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
+    if (src1.getIdx() != e.xmm3.getIdx()) {
+      e.vmovdqa(e.xmm3, src1);
+    }
+
+    e.vpsrld(e.xmm0, e.xmm3, 12);
+    e.vpand(e.xmm0, e.xmm0, e.GetXmmConstPtr(XMMEstimateIndexMask));
+    e.mov(e.rax, reinterpret_cast<uintptr_t>(estimate_tables.log2));
+    e.vpcmpeqd(e.xmm2, e.xmm2, e.xmm2);
+    e.vpgatherdd(e.xmm1, e.ptr[e.rax + e.xmm0 * 4], e.xmm2);
+
+    // ((exponent - 127) << 11) + entry is exact as a float, and so is
+    // dividing it by 2048
+    e.vpsrld(e.xmm0, e.xmm3, 23);
+    e.vpand(e.xmm0, e.xmm0, e.GetXmmConstPtr(XMMEstimateExponentMask));
+    e.vpsubd(e.xmm0, e.xmm0, e.GetXmmConstPtr(XMMVLogeExponentBias));
+    e.vpslld(e.xmm0, e.xmm0, 11);
+    e.vpaddd(e.xmm0, e.xmm0, e.xmm1);
+    e.vcvtdq2ps(e.xmm0, e.xmm0);
+    e.vmulps(i.dest, e.xmm0, e.GetXmmConstPtr(XMMVLogeScale));
+
+    // A negative input gives a NaN, infinity gives infinity, zero and
+    // denormals give -infinity (even when negative), and a NaN comes back
+    // quiet
+    e.vpsrad(e.xmm0, e.xmm3, 31);
+    e.vpblendvb(i.dest, i.dest, e.GetXmmConstPtr(XMMQNaN), e.xmm0);
+    e.vpcmpeqd(e.xmm0, e.xmm3, e.GetXmmConstPtr(XMMFloatInf));
+    e.vpblendvb(i.dest, i.dest, e.GetXmmConstPtr(XMMFloatInf), e.xmm0);
+    e.vpand(e.xmm0, e.xmm3, e.GetXmmConstPtr(XMMFloatInf));
+    e.vpxor(e.xmm1, e.xmm1, e.xmm1);
+    e.vpcmpeqd(e.xmm0, e.xmm0, e.xmm1);
+    e.vpblendvb(i.dest, i.dest, e.GetXmmConstPtr(XMMVLogeZeroResult), e.xmm0);
+    e.vpand(e.xmm1, e.xmm3, e.GetXmmConstPtr(XMMAbsMaskPS));
+    e.vpcmpgtd(e.xmm1, e.xmm1, e.GetXmmConstPtr(XMMFloatInf));
+    e.vpor(e.xmm0, e.xmm3, e.GetXmmConstPtr(XMMQuietBit));
+    e.vpblendvb(i.dest, i.dest, e.xmm0, e.xmm1);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_LOG2, LOG2_F32, LOG2_F64, LOG2_V128);
+
+// ============================================================================
+// OPCODE_DOT_PRODUCT_3
+// ============================================================================
+// A DOT_PRODUCT_3 source in dest with its fourth lane cleared, at compile time
+// for a constant.
+template <typename T>
+static Xmm LoadThreeLanes(X64Emitter& e, const T& src, Xmm dest) {
+  if (src.is_constant) {
+    vec128_t v = src.constant();
+    v.u32[3] = 0;
+    e.LoadConstantXmm(dest, v);
+  } else {
+    e.vandps(dest, src, e.GetXmmConstPtr(XMMThreeFloatMask));
+  }
+  return dest;
+}
+
+// The use_fast_dot_product path: the float64 sum of the products, truncated
+// to single. It matches the console in about 97% of cases; see
+// EmitVectorMultiplySum for the exact one.
+template <typename EmitArgType>
+static void EmitDotProductExceptional(X64Emitter& e, const EmitArgType& i,
+                                      Xbyak::Label& done) {
+  // A dot product of four float32 values can't overflow float64, so
+  // float32 overflow happened exactly when the float64 sum is finite
+  // but its float32 conversion has an all-ones exponent. Preserve
+  // infinities and NaNs originating in the inputs, as the previous
+  // MXCSR overflow-flag check did.
+  Xbyak::Label double_result_was_non_finite;
+  e.vmovq(e.rax, e.xmm2);
+  e.shr(e.rax, 52);
+  e.and_(e.eax, 0x7FF);
+  e.cmp(e.eax, 0x7FF);
+  e.je(double_result_was_non_finite);
+  e.vmovaps(i.dest, e.GetXmmConstPtr(XMMQNaN));
+  e.jmp(done, X64Emitter::T_NEAR);
+  e.L(double_result_was_non_finite);
+
+  e.vshufps(i.dest, e.xmm1, e.xmm1, 0);
+  e.jmp(done, X64Emitter::T_NEAR);
+}
+
+template <typename EmitArgType>
+static void EmitDotProductResult(X64Emitter& e, const EmitArgType& i) {
+  Xbyak::Label& done = e.NewCachedLabel();
+  Xbyak::Label& exceptional_result =
+      e.AddToTail([i, &done](X64Emitter& e, Xbyak::Label& exceptional_result) {
+        e.L(exceptional_result);
+        EmitDotProductExceptional(e, i, done);
+      });
+
+  // The common finite result needs no MXCSR status round trip. Check only the
+  // float32 exponent and leave all exceptional handling in cold tail code.
+  e.vmovd(e.eax, e.xmm1);
+  e.add(e.eax, e.eax);  // Discard the sign bit.
+  e.cmp(e.eax, 0xFF000000);
+  e.jae(exceptional_result, X64Emitter::T_NEAR);
+  e.vshufps(i.dest, e.xmm1, e.xmm1, 0);
+  e.L(done);
+}
+
+// Converts the float64 sum in xmm2 to float32, rounded toward zero, and splats
+// it into dest. With the bits below single precision cleared, a sum in
+// float32's normal range (or zero) is exactly a float32, so the masked
+// conversion gives the same bits as rounding the sum toward zero. AVX-512 does
+// that in the conversion itself, which takes the and off the result's path;
+// the range check only decides a branch. Other sums take the masked path.
+template <typename EmitArgType>
+static void EmitDotProductRoundTowardZero(X64Emitter& e, const EmitArgType& i) {
+  if (!e.IsFeatureEnabled(kX64EmitAVX512F)) {
+    e.vandpd(e.xmm2, e.xmm2, e.GetXmmConstPtr(XMMDoubleToSingleTruncateMask));
+    e.vcvtsd2ss(e.xmm1, e.xmm2, e.xmm2);
+    EmitDotProductResult(e, i);
+    return;
+  }
+
+  Xbyak::Label& done = e.NewCachedLabel();
+  Xbyak::Label& masked = e.AddToTail([i, &done](X64Emitter& e,
+                                                Xbyak::Label& masked) {
+    e.L(masked);
+    e.vandpd(e.xmm2, e.xmm2, e.GetXmmConstPtr(XMMDoubleToSingleTruncateMask));
+    e.vcvtsd2ss(e.xmm1, e.xmm2, e.xmm2);
+    Xbyak::Label finite;
+    e.vmovd(e.eax, e.xmm1);
+    e.add(e.eax, e.eax);  // Discard the sign bit.
+    e.cmp(e.eax, 0xFF000000);
+    e.jb(finite);
+    EmitDotProductExceptional(e, i, done);
+    e.L(finite);
+    e.vshufps(i.dest, e.xmm1, e.xmm1, 0);
+    e.jmp(done, X64Emitter::T_NEAR);
+  });
+
+  Xbyak::Label& exact = e.NewCachedLabel();
+  e.vcvtsd2ss(e.xmm1, e.xmm2, e.xmm2 | e.T_rz_sae);
+  e.vmovq(e.rax, e.xmm2);
+  e.add(e.rax, e.rax);  // Discard the sign bit.
+  e.jz(exact);
+  // Biased exponents 897-1150 are float32's normal range, 2^-126 to 2^128
+  e.shr(e.rax, 53);
+  e.sub(e.eax, 1023 - 126);
+  e.cmp(e.eax, 254);
+  e.jae(masked, X64Emitter::T_NEAR);
+  e.L(exact);
+  e.vshufps(i.dest, e.xmm1, e.xmm1, 0);
+  e.L(done);
+}
+
+template <typename EmitArgType>
+static void EmitFastDotProduct3(X64Emitter& e, const EmitArgType& i) {
+  e.ChangeMxcsrMode(VmxDenormalFlushMode());
+  bool is_lensqr = i.instr->src1.value == i.instr->src2.value;
+
+  LoadThreeLanes(e, i.src1, e.xmm3);
+  if (!is_lensqr) {
+    LoadThreeLanes(e, i.src2, e.xmm2);
+
+    e.vcvtps2pd(e.ymm0, e.xmm3);
+    e.vcvtps2pd(e.ymm1, e.xmm2);
+
+    /*
+        ymm0 = src1 as doubles, ele 3 cleared
+        ymm1 = src2 as doubles, ele 3 cleared
+    */
+    e.vmulpd(e.ymm3, e.ymm0, e.ymm1);
+  } else {
+    e.vcvtps2pd(e.ymm0, e.xmm3);
+    e.vmulpd(e.ymm3, e.ymm0, e.ymm0);
+  }
+  e.vextractf128(e.xmm2, e.ymm3, 1);
+  e.vunpckhpd(e.xmm0, e.xmm3, e.xmm3);  // get element [1] in xmm3
+  e.vaddsd(e.xmm3, e.xmm3, e.xmm2);
+  e.vaddsd(e.xmm2, e.xmm3, e.xmm0);
+  EmitDotProductRoundTowardZero(e, i);
+}
+
+template <typename EmitArgType>
+static void EmitFastDotProduct4(X64Emitter& e, const EmitArgType& i) {
+  e.ChangeMxcsrMode(VmxDenormalFlushMode());
+  bool is_lensqr = i.instr->src1.value == i.instr->src2.value;
+
+  auto src1v = e.xmm3;
+  auto src2v = e.xmm2;
+  if (i.src1.is_constant) {
+    src1v = e.xmm3;
+    e.LoadConstantXmm(src1v, i.src1.constant());
+  } else {
+    src1v = i.src1.reg();
+  }
+  if (i.src2.is_constant) {
+    src2v = e.xmm2;
+    e.LoadConstantXmm(src2v, i.src2.constant());
+  } else {
+    src2v = i.src2.reg();
+  }
+  if (is_lensqr) {
+    e.vcvtps2pd(e.ymm0, src1v);
+
+    e.vmulpd(e.ymm3, e.ymm0, e.ymm0);
+  } else {
+    e.vcvtps2pd(e.ymm0, src1v);
+    e.vcvtps2pd(e.ymm1, src2v);
+
+    e.vmulpd(e.ymm3, e.ymm0, e.ymm1);
+  }
+  e.vextractf128(e.xmm2, e.ymm3, 1);
+  e.vaddpd(e.xmm3, e.xmm3, e.xmm2);
+
+  e.vunpckhpd(e.xmm0, e.xmm3, e.xmm3);
+  e.vaddsd(e.xmm2, e.xmm3, e.xmm0);
+  EmitDotProductRoundTowardZero(e, i);
+}
+
+// vmsum3fp128 and vmsum4fp128, bit-exact with the console. Its adder works on
+// a 30-bit window: the products are exact, and each one's magnitude is
+// truncated to a grid of 2^(S - 28), where S is the largest exponent sum
+// (unbiased exponent of a plus that of b) among products that aren't zero. The
+// products of the majority sign (positive on a tie) add their truncated
+// magnitude T and the others add ~T = -(T + 1), zero products included. A
+// negative total t becomes a magnitude by ~t, with the minority's sign; that
+// magnitude truncated to single is the result. An exact cancellation is +0,
+// products that are all zero give -0 only if every one is -0, a denormal
+// operand or result is flushed to zero, an overflow gives a QNaN with the sign
+// and truncated mantissa, and an infinite operand gives an infinity or, as any
+// NaN operand does, the default QNaN.
+//
+// In terms of u, the signed sum of the truncated products, with s the
+// majority sign and k the number of products of the other sign, that comes to
+// u - s * k, plus s when s * u < k. The products and the grid fit doubles
+// exactly: vroundpd truncates each scaled product, keeping its sign, and the
+// sum of at most four terms under 2^32 is exact. s and k come from a table by
+// the number of negative products. lanes is 3 or 4; vmsum3fp128 leaves the
+// fourth lane out.
+template <typename EmitArgType>
+static void EmitVectorMultiplySum(X64Emitter& e, const EmitArgType& i,
+                                  int lanes) {
+  e.ChangeMxcsrMode(VmxDenormalFlushMode());
+  Xbyak::Label& done = e.NewCachedLabel();
+  // Only zero products: -0 if every one is -0, unless one is NaN (infinity
+  // times zero). ymm0 holds the products.
+  Xbyak::Label& all_zero =
+      e.AddToTail([lanes, &done](X64Emitter& e, Xbyak::Label& tail) {
+        e.L(tail);
+        Xbyak::Label not_nan;
+        e.vcmpunordpd(e.ymm1, e.ymm0, e.ymm0);
+        e.vmovmskpd(e.ecx, e.ymm1);
+        e.test(e.ecx, e.ecx);
+        e.jz(not_nan);
+        e.vmovaps(e.xmm1, e.GetXmmConstPtr(XMMQNaN));
+        e.jmp(done, X64Emitter::T_NEAR);
+        e.L(not_nan);
+        e.vmovmskpd(e.ecx, e.ymm0);
+        if (lanes == 3) {
+          e.and_(e.ecx, 0x7);
+        }
+        e.xor_(e.eax, e.eax);
+        e.cmp(e.ecx, lanes == 3 ? 0x7 : 0xF);
+        e.mov(e.ecx, 0x80000000);
+        e.cmove(e.eax, e.ecx);
+        e.vmovd(e.xmm1, e.eax);
+        e.jmp(done, X64Emitter::T_NEAR);
+      });
+
+  if (lanes == 3) {
+    LoadThreeLanes(e, i.src1, e.xmm0);
+    LoadThreeLanes(e, i.src2, e.xmm1);
+  } else {
+    e.vmovaps(e.xmm0, GetInputRegOrConstant(e, i.src1, e.xmm0));
+    e.vmovaps(e.xmm1, GetInputRegOrConstant(e, i.src2, e.xmm1));
+  }
+  // Biased exponents
+  e.vpslld(e.xmm2, e.xmm0, 1);
+  e.vpsrld(e.xmm2, e.xmm2, 24);
+  e.vpslld(e.xmm3, e.xmm1, 1);
+  e.vpsrld(e.xmm3, e.xmm3, 24);
+  // The exact products; the VMX MXCSR flushes denormal operands to zero
+  e.vcvtps2pd(e.ymm0, e.xmm0);
+  e.vcvtps2pd(e.ymm1, e.xmm1);
+  e.vmulpd(e.ymm0, e.ymm0, e.ymm1);
+  // The largest exponent sum of a nonzero product, in every lane
+  e.vpminsd(e.xmm1, e.xmm2, e.xmm3);
+  e.vpaddd(e.xmm2, e.xmm2, e.xmm3);
+  e.vpcmpeqd(e.xmm1, e.xmm1, e.GetXmmConstPtr(XMMZero));
+  e.vpandn(e.xmm2, e.xmm1, e.xmm2);
+  e.vpshufd(e.xmm1, e.xmm2, 0x4E);
+  e.vpmaxsd(e.xmm2, e.xmm2, e.xmm1);
+  e.vpshufd(e.xmm1, e.xmm2, 0xB1);
+  e.vpmaxsd(e.xmm2, e.xmm2, e.xmm1);
+  e.vmovd(e.eax, e.xmm2);
+  e.test(e.eax, e.eax);
+  e.jz(all_zero, X64Emitter::T_NEAR);
+  // The inverse grid, 2^(28 - S), in all four doubles
+  e.vmovdqa(e.xmm1, e.GetXmmConstPtr(XMMVmsumInverseGridBase));
+  e.vpsubd(e.xmm1, e.xmm1, e.xmm2);
+  e.vpsllq(e.xmm1, e.xmm1, 52);
+  e.vinsertf128(e.ymm1, e.ymm1, e.xmm1, 1);
+  // The products truncated to the grid, and their signed sum u
+  e.vmulpd(e.ymm2, e.ymm0, e.ymm1);
+  e.vroundpd(e.ymm2, e.ymm2, 0b1011);
+  e.vmovmskpd(e.ecx, e.ymm0);
+  e.popcnt(e.ecx, e.ecx);
+  e.shl(e.ecx, 4);
+  e.vextractf128(e.xmm3, e.ymm2, 1);
+  if (lanes == 4) {
+    e.vaddpd(e.xmm2, e.xmm2, e.xmm3);
+    e.vunpckhpd(e.xmm3, e.xmm2, e.xmm2);
+    e.vaddsd(e.xmm2, e.xmm2, e.xmm3);
+  } else {
+    e.vunpckhpd(e.xmm0, e.xmm2, e.xmm2);
+    e.vaddsd(e.xmm2, e.xmm2, e.xmm0);
+    e.vaddsd(e.xmm2, e.xmm2, e.xmm3);
+  }
+  // d = u - s * k, then add s back when s * d < 0, from -s * k and -s
+  void* adjust = e.backend()->LookupXMMConstantAddress(
+      lanes == 3 ? XMMVmsum3Adjust : XMMVmsum4Adjust);
+  e.vmovapd(e.xmm3, e.ptr[e.rcx + reinterpret_cast<size_t>(adjust)]);
+  e.vaddsd(e.xmm2, e.xmm2, e.xmm3);
+  e.vunpckhpd(e.xmm0, e.xmm3, e.xmm3);
+  e.vmulsd(e.xmm3, e.xmm2, e.xmm0);
+  e.vcmpnlesd(e.xmm3, e.xmm3, e.GetXmmConstPtr(XMMZero));
+  e.vandpd(e.xmm0, e.xmm0, e.xmm3);
+  e.vsubsd(e.xmm2, e.xmm2, e.xmm0);
+  // Back from the grid, then truncated to single
+  e.vmovdqa(e.xmm3, e.GetXmmConstPtr(XMMVmsumGridSum));
+  e.vpsubq(e.xmm3, e.xmm3, e.xmm1);
+  e.vmulsd(e.xmm2, e.xmm2, e.xmm3);
+  e.vandpd(e.xmm2, e.xmm2, e.GetXmmConstPtr(XMMDoubleToSingleTruncateMask));
+  e.vcvtsd2ss(e.xmm1, e.xmm2, e.xmm2);
+  // An all-ones exponent. From a finite sum (xmm2, truncated), an overflow: a
+  // QNaN keeping the sign and the truncated mantissa. Otherwise an operand was
+  // infinite or NaN: the IEEE sum, with a NaN made the default QNaN.
+  Xbyak::Label& exceptional =
+      e.AddToTail([i, lanes, &done](X64Emitter& e, Xbyak::Label& tail) {
+        e.L(tail);
+        Xbyak::Label nonfinite;
+        e.vmovq(e.rax, e.xmm2);
+        e.mov(e.rcx, e.rax);
+        e.shr(e.rcx, 52);
+        e.and_(e.ecx, 0x7FF);
+        e.cmp(e.ecx, 0x7FF);
+        e.je(nonfinite);
+        e.mov(e.rcx, e.rax);
+        e.shr(e.rcx, 29);
+        e.and_(e.ecx, 0x7FFFFF);
+        e.shr(e.rax, 32);
+        e.and_(e.eax, 0x80000000);
+        e.or_(e.eax, e.ecx);
+        e.or_(e.eax, 0x7FC00000);
+        e.vmovd(e.xmm1, e.eax);
+        e.jmp(done, X64Emitter::T_NEAR);
+
+        e.L(nonfinite);
+        Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+        Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+        e.vcvtps2pd(e.ymm0, src1);
+        e.vcvtps2pd(e.ymm1, src2);
+        e.vmulpd(e.ymm0, e.ymm0, e.ymm1);
+        e.vextractf128(e.xmm1, e.ymm0, 1);
+        e.vunpckhpd(e.xmm2, e.xmm0, e.xmm0);
+        e.vaddsd(e.xmm0, e.xmm0, e.xmm2);
+        e.vaddsd(e.xmm0, e.xmm0, e.xmm1);
+        if (lanes == 4) {
+          e.vunpckhpd(e.xmm2, e.xmm1, e.xmm1);
+          e.vaddsd(e.xmm0, e.xmm0, e.xmm2);
+        }
+        Xbyak::Label not_nan;
+        e.vucomisd(e.xmm0, e.xmm0);
+        e.jnp(not_nan);
+        e.vmovaps(e.xmm1, e.GetXmmConstPtr(XMMQNaN));
+        e.jmp(done, X64Emitter::T_NEAR);
+        e.L(not_nan);
+        e.vcvtsd2ss(e.xmm1, e.xmm0, e.xmm0);
+        e.jmp(done, X64Emitter::T_NEAR);
+      });
+  e.vmovd(e.eax, e.xmm1);
+  e.add(e.eax, e.eax);  // Discard the sign bit.
+  e.cmp(e.eax, 0xFF000000);
+  e.jae(exceptional, X64Emitter::T_NEAR);
+  e.L(done);
+  e.vshufps(i.dest, e.xmm1, e.xmm1, 0);
+}
+
+struct DOT_PRODUCT_3_V128
+    : Sequence<DOT_PRODUCT_3_V128,
+               I<OPCODE_DOT_PRODUCT_3, V128Op, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (cvars::use_fast_dot_product) {
+      EmitFastDotProduct3(e, i);
+    } else {
+      EmitVectorMultiplySum(e, i, 3);
+    }
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_DOT_PRODUCT_3, DOT_PRODUCT_3_V128);
+
+// ============================================================================
+// OPCODE_DOT_PRODUCT_4
+// ============================================================================
+struct DOT_PRODUCT_4_V128
+    : Sequence<DOT_PRODUCT_4_V128,
+               I<OPCODE_DOT_PRODUCT_4, V128Op, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (cvars::use_fast_dot_product) {
+      EmitFastDotProduct4(e, i);
+    } else {
+      EmitVectorMultiplySum(e, i, 4);
+    }
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_DOT_PRODUCT_4, DOT_PRODUCT_4_V128);
+
+// ============================================================================
+// OPCODE_AND
+// ============================================================================
+// TODO(benvanik): put dest/src1|2 together.
+template <typename SEQ, typename REG, typename ARGS>
+void EmitAndXX(X64Emitter& e, const ARGS& i) {
+  SEQ::EmitCommutativeBinaryOp(
+      e, i,
+      [](X64Emitter& e, const REG& dest_src, const REG& src) {
+        e.and_(dest_src, src);
+      },
+      [](X64Emitter& e, const REG& dest_src, int32_t constant) {
+        if (constant == 0xFF) {
+          if (dest_src.getBit() == 16 || dest_src.getBit() == 32) {
+            e.movzx(dest_src, dest_src.cvt8());
+            return;
+          } else if (dest_src.getBit() == 64) {
+            // take advantage of automatic zeroing of upper 32 bits
+            e.movzx(dest_src.cvt32(), dest_src.cvt8());
+            return;
+          }
+        } else if (constant == 0xFFFF) {
+          if (dest_src.getBit() == 32) {
+            e.movzx(dest_src, dest_src.cvt16());
+            return;
+          } else if (dest_src.getBit() == 64) {
+            e.movzx(dest_src.cvt32(), dest_src.cvt16());
+            return;
+          }
+        } else if (dest_src.getBit() == 64 && constant > 0) {
+          // do 32 bit and, not the full 64, because the upper 32 of the mask
+          // are zero and the 32 bit op will auto clear the top, save space on
+          // the immediate and avoid a rex prefix
+          e.and_(dest_src.cvt32(), constant);
+          return;
+        }
+        e.and_(dest_src, constant);
+      });
+}
+struct AND_I8 : Sequence<AND_I8, I<OPCODE_AND, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitAndXX<AND_I8, Reg8>(e, i);
+  }
+};
+struct AND_I16 : Sequence<AND_I16, I<OPCODE_AND, I16Op, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitAndXX<AND_I16, Reg16>(e, i);
+  }
+};
+struct AND_I32 : Sequence<AND_I32, I<OPCODE_AND, I32Op, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitAndXX<AND_I32, Reg32>(e, i);
+  }
+};
+// btr/bts is 5 bytes where movabs + and/or is 10; nothing consumes the flags.
+static bool TryEmitSingleBitMask(X64Emitter& e, const I64Op& dest,
+                                 const I64Op& src, uint64_t constant,
+                                 bool set) {
+  const uint64_t bit = set ? constant : ~constant;
+  if (!bit || (bit & (bit - 1))) {
+    return false;
+  }
+  if (static_cast<int64_t>(constant) ==
+      static_cast<int64_t>(static_cast<int32_t>(constant))) {
+    return false;
+  }
+  if (dest != src.reg()) {
+    e.mov(dest, src);
+  }
+  if (set) {
+    e.bts(dest, xe::tzcnt(bit));
+  } else {
+    e.btr(dest, xe::tzcnt(bit));
+  }
+  return true;
+}
+struct AND_I64 : Sequence<AND_I64, I<OPCODE_AND, I64Op, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (i.src2.is_constant && i.src2.constant() == 0xFFFFFFFF) {
+      // special case for rlwinm codegen
+      e.mov(((Reg64)i.dest).cvt32(), ((Reg64)i.src1).cvt32());
+      return;
+    }
+    if (i.src2.is_constant && !i.src1.is_constant &&
+        TryEmitSingleBitMask(e, i.dest, i.src1, i.src2.constant(), false)) {
+      return;
+    }
+    if (i.src1.is_constant && !i.src2.is_constant &&
+        TryEmitSingleBitMask(e, i.dest, i.src2, i.src1.constant(), false)) {
+      return;
+    }
+    EmitAndXX<AND_I64, Reg64>(e, i);
+  }
+};
+struct AND_V128 : Sequence<AND_V128, I<OPCODE_AND, V128Op, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    SimdDomain dom = PickDomain2(e.DeduceSimdDomain(i.src1.value),
+                                 e.DeduceSimdDomain(i.src2.value));
+
+    EmitCommutativeBinaryXmmOp(
+        e, i, [dom](X64Emitter& e, Xmm dest, Xmm src1, Xmm src2) {
+          if (dom == SimdDomain::FLOATING) {
+            e.vandps(dest, src2, src1);
+          } else {
+            e.vpand(dest, src2, src1);
+          }
+        });
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_AND, AND_I8, AND_I16, AND_I32, AND_I64, AND_V128);
+
+// ============================================================================
+// OPCODE_AND_NOT
+// ============================================================================
+template <typename SEQ, typename REG, typename ARGS>
+void EmitAndNotXX(X64Emitter& e, const ARGS& i) {
+  if (i.src1.is_constant) {
+    // src1 constant.
+    // `and` instruction only supports up to 32-bit immediate constants
+    // 64-bit constants will need a temp register
+    // only possible with 64 bit inputs, andc is the only instruction that
+    // generates this
+    auto temp = GetTempReg<typename decltype(i.src1)::reg_type>(e);
+    e.mov(temp, i.src1.constant());
+
+    if (e.IsFeatureEnabled(kX64EmitBMI1)) {
+      e.andn(i.dest.reg().cvt64(), i.src2.reg().cvt64(), temp.cvt64());
+    } else {
+      e.mov(i.dest, i.src2);
+      e.not_(i.dest);
+      e.and_(i.dest, temp);
+    }
+  } else if (i.src2.is_constant) {
+    // src2 constant.
+    if (i.dest == i.src1) {
+      auto temp = GetTempReg<typename decltype(i.src2)::reg_type>(e);
+      e.mov(temp, ~i.src2.constant());
+      e.and_(i.dest, temp);
+    } else {
+      e.mov(i.dest, i.src1);
+      auto temp = GetTempReg<typename decltype(i.src2)::reg_type>(e);
+      e.mov(temp, ~i.src2.constant());
+      e.and_(i.dest, temp);
+    }
+  } else {
+    // neither are constant
+    if (e.IsFeatureEnabled(kX64EmitBMI1)) {
+      e.andn(i.dest.reg().cvt64(), i.src2.reg().cvt64(), i.src1.reg().cvt64());
+    } else {
+      if (i.dest == i.src2) {
+        e.not_(i.dest);
+        e.and_(i.dest, i.src1);
+      } else if (i.dest == i.src1) {
+        auto temp = GetTempReg<typename decltype(i.dest)::reg_type>(e);
+        e.mov(temp, i.src2);
+        e.not_(temp);
+        e.and_(i.dest, temp);
+      } else {
+        e.mov(i.dest, i.src2);
+        e.not_(i.dest);
+        e.and_(i.dest, i.src1);
+      }
+    }
+  }
+}
+struct AND_NOT_I8 : Sequence<AND_NOT_I8, I<OPCODE_AND_NOT, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitAndNotXX<AND_NOT_I8, Reg8>(e, i);
+  }
+};
+struct AND_NOT_I16
+    : Sequence<AND_NOT_I16, I<OPCODE_AND_NOT, I16Op, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitAndNotXX<AND_NOT_I16, Reg16>(e, i);
+  }
+};
+struct AND_NOT_I32
+    : Sequence<AND_NOT_I32, I<OPCODE_AND_NOT, I32Op, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitAndNotXX<AND_NOT_I32, Reg32>(e, i);
+  }
+};
+struct AND_NOT_I64
+    : Sequence<AND_NOT_I64, I<OPCODE_AND_NOT, I64Op, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitAndNotXX<AND_NOT_I64, Reg64>(e, i);
+  }
+};
+struct AND_NOT_V128
+    : Sequence<AND_NOT_V128, I<OPCODE_AND_NOT, V128Op, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    SimdDomain dom = PickDomain2(e.DeduceSimdDomain(i.src1.value),
+                                 e.DeduceSimdDomain(i.src2.value));
+
+    EmitCommutativeBinaryXmmOp(
+        e, i, [dom](X64Emitter& e, Xmm dest, Xmm src1, Xmm src2) {
+          if (dom == SimdDomain::FLOATING) {
+            e.vandnps(dest, src2, src1);
+          } else {
+            e.vpandn(dest, src2, src1);
+          }
+        });
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_AND_NOT, AND_NOT_I8, AND_NOT_I16, AND_NOT_I32,
+                     AND_NOT_I64, AND_NOT_V128);
+
+// ============================================================================
+// OPCODE_OR
+// ============================================================================
+// TODO(benvanik): put dest/src1|2 together.
+template <typename SEQ, typename REG, typename ARGS>
+void EmitOrXX(X64Emitter& e, const ARGS& i) {
+  SEQ::EmitCommutativeBinaryOp(
+      e, i,
+      [](X64Emitter& e, const REG& dest_src, const REG& src) {
+        e.or_(dest_src, src);
+      },
+      [](X64Emitter& e, const REG& dest_src, int32_t constant) {
+        e.or_(dest_src, constant);
+      });
+}
+struct OR_I8 : Sequence<OR_I8, I<OPCODE_OR, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitOrXX<OR_I8, Reg8>(e, i);
+  }
+};
+struct OR_I16 : Sequence<OR_I16, I<OPCODE_OR, I16Op, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitOrXX<OR_I16, Reg16>(e, i);
+  }
+};
+struct OR_I32 : Sequence<OR_I32, I<OPCODE_OR, I32Op, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitOrXX<OR_I32, Reg32>(e, i);
+  }
+};
+struct OR_I64 : Sequence<OR_I64, I<OPCODE_OR, I64Op, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (i.src2.is_constant && !i.src1.is_constant &&
+        TryEmitSingleBitMask(e, i.dest, i.src1, i.src2.constant(), true)) {
+      return;
+    }
+    if (i.src1.is_constant && !i.src2.is_constant &&
+        TryEmitSingleBitMask(e, i.dest, i.src2, i.src1.constant(), true)) {
+      return;
+    }
+    EmitOrXX<OR_I64, Reg64>(e, i);
+  }
+};
+struct OR_V128 : Sequence<OR_V128, I<OPCODE_OR, V128Op, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    SimdDomain dom = PickDomain2(e.DeduceSimdDomain(i.src1.value),
+                                 e.DeduceSimdDomain(i.src2.value));
+
+    EmitCommutativeBinaryXmmOp(
+        e, i, [dom](X64Emitter& e, Xmm dest, Xmm src1, Xmm src2) {
+          if (dom == SimdDomain::FLOATING) {
+            e.vorps(dest, src1, src2);
+          } else {
+            e.vpor(dest, src1, src2);
+          }
+        });
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_OR, OR_I8, OR_I16, OR_I32, OR_I64, OR_V128);
+
+// ============================================================================
+// OPCODE_XOR
+// ============================================================================
+// TODO(benvanik): put dest/src1|2 together.
+template <typename SEQ, typename REG, typename ARGS>
+void EmitXorXX(X64Emitter& e, const ARGS& i) {
+  SEQ::EmitCommutativeBinaryOp(
+      e, i,
+      [](X64Emitter& e, const REG& dest_src, const REG& src) {
+        e.xor_(dest_src, src);
+      },
+      [](X64Emitter& e, const REG& dest_src, int32_t constant) {
+        e.xor_(dest_src, constant);
+      });
+}
+struct XOR_I8 : Sequence<XOR_I8, I<OPCODE_XOR, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitXorXX<XOR_I8, Reg8>(e, i);
+  }
+};
+struct XOR_I16 : Sequence<XOR_I16, I<OPCODE_XOR, I16Op, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitXorXX<XOR_I16, Reg16>(e, i);
+  }
+};
+struct XOR_I32 : Sequence<XOR_I32, I<OPCODE_XOR, I32Op, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitXorXX<XOR_I32, Reg32>(e, i);
+  }
+};
+struct XOR_I64 : Sequence<XOR_I64, I<OPCODE_XOR, I64Op, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitXorXX<XOR_I64, Reg64>(e, i);
+  }
+};
+struct XOR_V128 : Sequence<XOR_V128, I<OPCODE_XOR, V128Op, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    SimdDomain dom = PickDomain2(e.DeduceSimdDomain(i.src1.value),
+                                 e.DeduceSimdDomain(i.src2.value));
+
+    EmitCommutativeBinaryXmmOp(
+        e, i, [dom](X64Emitter& e, Xmm dest, Xmm src1, Xmm src2) {
+          if (dom == SimdDomain::FLOATING) {
+            e.vxorps(dest, src1, src2);
+          } else {
+            e.vpxor(dest, src1, src2);
+          }
+        });
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_XOR, XOR_I8, XOR_I16, XOR_I32, XOR_I64, XOR_V128);
+
+// ============================================================================
+// OPCODE_NOT
+// ============================================================================
+// TODO(benvanik): put dest/src1 together.
+template <typename SEQ, typename REG, typename ARGS>
+void EmitNotXX(X64Emitter& e, const ARGS& i) {
+  SEQ::EmitUnaryOp(
+      e, i, [](X64Emitter& e, const REG& dest_src) { e.not_(dest_src); });
+}
+struct NOT_I8 : Sequence<NOT_I8, I<OPCODE_NOT, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitNotXX<NOT_I8, Reg8>(e, i);
+  }
+};
+struct NOT_I16 : Sequence<NOT_I16, I<OPCODE_NOT, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitNotXX<NOT_I16, Reg16>(e, i);
+  }
+};
+struct NOT_I32 : Sequence<NOT_I32, I<OPCODE_NOT, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitNotXX<NOT_I32, Reg32>(e, i);
+  }
+};
+struct NOT_I64 : Sequence<NOT_I64, I<OPCODE_NOT, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitNotXX<NOT_I64, Reg64>(e, i);
+  }
+};
+struct NOT_V128 : Sequence<NOT_V128, I<OPCODE_NOT, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (e.IsFeatureEnabled(kX64EmitAVX512Ortho)) {
+      e.vpternlogd(i.dest, i.src1, i.src1, 0b01010101);
+      return;
+    }
+    SimdDomain domain = e.DeduceSimdDomain(i.src1.value);
+    if (domain == SimdDomain::FLOATING) {
+      e.vxorps(i.dest, i.src1, e.GetXmmConstPtr(XMMFFFF /* FF... */));
+    } else {
+      // dest = src ^ 0xFFFF...
+      e.vpxor(i.dest, i.src1, e.GetXmmConstPtr(XMMFFFF /* FF... */));
+    }
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_NOT, NOT_I8, NOT_I16, NOT_I32, NOT_I64, NOT_V128);
+
+// ============================================================================
+// OPCODE_SHL
+// ============================================================================
+// TODO(benvanik): optimize common shifts.
+template <typename SEQ, typename REG, typename ARGS>
+void EmitShlXX(X64Emitter& e, const ARGS& i) {
+  SEQ::EmitAssociativeBinaryOp(
+      e, i,
+      [](X64Emitter& e, const REG& dest_src, const Reg8& src) {
+        // shlx: $1 = $2 << $3
+        // shl: $1 = $1 << $2
+        if (e.IsFeatureEnabled(kX64EmitBMI2)) {
+          if (dest_src.getBit() == 64) {
+            e.shlx(dest_src.cvt64(), dest_src.cvt64(), src.cvt64());
+          } else {
+            e.shlx(dest_src.cvt32(), dest_src.cvt32(), src.cvt32());
+          }
+        } else {
+          e.mov(e.cl, src);
+          e.shl(dest_src, e.cl);
+        }
+      },
+      [](X64Emitter& e, const REG& dest_src, int8_t constant) {
+        e.shl(dest_src, constant);
+      });
+}
+struct SHL_I8 : Sequence<SHL_I8, I<OPCODE_SHL, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitShlXX<SHL_I8, Reg8>(e, i);
+  }
+};
+struct SHL_I16 : Sequence<SHL_I16, I<OPCODE_SHL, I16Op, I16Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitShlXX<SHL_I16, Reg16>(e, i);
+  }
+};
+struct SHL_I32 : Sequence<SHL_I32, I<OPCODE_SHL, I32Op, I32Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitShlXX<SHL_I32, Reg32>(e, i);
+  }
+};
+struct SHL_I64 : Sequence<SHL_I64, I<OPCODE_SHL, I64Op, I64Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitShlXX<SHL_I64, Reg64>(e, i);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_SHL, SHL_I8, SHL_I16, SHL_I32, SHL_I64);
+
+// ============================================================================
+// OPCODE_SHR
+// ============================================================================
+// TODO(benvanik): optimize common shifts.
+template <typename SEQ, typename REG, typename ARGS>
+void EmitShrXX(X64Emitter& e, const ARGS& i) {
+  SEQ::EmitAssociativeBinaryOp(
+      e, i,
+      [](X64Emitter& e, const REG& dest_src, const Reg8& src) {
+        // shrx: op1 dest, op2 src, op3 count
+        // shr: op1 src/dest, op2 count
+        if (e.IsFeatureEnabled(kX64EmitBMI2)) {
+          if (dest_src.getBit() == 64) {
+            e.shrx(dest_src.cvt64(), dest_src.cvt64(), src.cvt64());
+          } else if (dest_src.getBit() == 32) {
+            e.shrx(dest_src.cvt32(), dest_src.cvt32(), src.cvt32());
+          } else {
+            e.movzx(dest_src.cvt32(), dest_src);
+            e.shrx(dest_src.cvt32(), dest_src.cvt32(), src.cvt32());
+          }
+        } else {
+          e.mov(e.cl, src);
+          e.shr(dest_src, e.cl);
+        }
+      },
+      [](X64Emitter& e, const REG& dest_src, int8_t constant) {
+        e.shr(dest_src, constant);
+      });
+}
+struct SHR_I8 : Sequence<SHR_I8, I<OPCODE_SHR, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitShrXX<SHR_I8, Reg8>(e, i);
+  }
+};
+struct SHR_I16 : Sequence<SHR_I16, I<OPCODE_SHR, I16Op, I16Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitShrXX<SHR_I16, Reg16>(e, i);
+  }
+};
+struct SHR_I32 : Sequence<SHR_I32, I<OPCODE_SHR, I32Op, I32Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitShrXX<SHR_I32, Reg32>(e, i);
+  }
+};
+struct SHR_I64 : Sequence<SHR_I64, I<OPCODE_SHR, I64Op, I64Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitShrXX<SHR_I64, Reg64>(e, i);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_SHR, SHR_I8, SHR_I16, SHR_I32, SHR_I64);
+
+// ============================================================================
+// OPCODE_SHA
+// ============================================================================
+// TODO(benvanik): optimize common shifts.
+template <typename SEQ, typename REG, typename ARGS>
+void EmitSarXX(X64Emitter& e, const ARGS& i) {
+  SEQ::EmitAssociativeBinaryOp(
+      e, i,
+      [](X64Emitter& e, const REG& dest_src, const Reg8& src) {
+        if (e.IsFeatureEnabled(kX64EmitBMI2)) {
+          if (dest_src.getBit() == 64) {
+            e.sarx(dest_src.cvt64(), dest_src.cvt64(), src.cvt64());
+          } else if (dest_src.getBit() == 32) {
+            e.sarx(dest_src.cvt32(), dest_src.cvt32(), src.cvt32());
+          } else {
+            e.movsx(dest_src.cvt32(), dest_src);
+            e.sarx(dest_src.cvt32(), dest_src.cvt32(), src.cvt32());
+          }
+        } else {
+          e.mov(e.cl, src);
+          e.sar(dest_src, e.cl);
+        }
+      },
+      [](X64Emitter& e, const REG& dest_src, int8_t constant) {
+        e.sar(dest_src, constant);
+      });
+}
+struct SHA_I8 : Sequence<SHA_I8, I<OPCODE_SHA, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitSarXX<SHA_I8, Reg8>(e, i);
+  }
+};
+struct SHA_I16 : Sequence<SHA_I16, I<OPCODE_SHA, I16Op, I16Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitSarXX<SHA_I16, Reg16>(e, i);
+  }
+};
+struct SHA_I32 : Sequence<SHA_I32, I<OPCODE_SHA, I32Op, I32Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitSarXX<SHA_I32, Reg32>(e, i);
+  }
+};
+struct SHA_I64 : Sequence<SHA_I64, I<OPCODE_SHA, I64Op, I64Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitSarXX<SHA_I64, Reg64>(e, i);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_SHA, SHA_I8, SHA_I16, SHA_I32, SHA_I64);
+
+// ============================================================================
+// OPCODE_ROTATE_LEFT
+// ============================================================================
+// TODO(benvanik): put dest/src1 together, src2 in cl.
+template <typename SEQ, typename REG, typename ARGS>
+void EmitRotateLeftXX(X64Emitter& e, const ARGS& i) {
+  if (i.src2.is_constant) {
+    // Constant rotate.
+    if (i.dest != i.src1) {
+      if (i.src1.is_constant) {
+        e.mov(i.dest, i.src1.constant());
+      } else {
+        e.mov(i.dest, i.src1);
+      }
+    }
+    e.rol(i.dest, i.src2.constant());
+  } else {
+    // Variable rotate.
+    if (i.src2.reg().getIdx() != e.cl.getIdx()) {
+      e.mov(e.cl, i.src2);
+    }
+    if (i.dest != i.src1) {
+      if (i.src1.is_constant) {
+        e.mov(i.dest, i.src1.constant());
+      } else {
+        e.mov(i.dest, i.src1);
+      }
+    }
+    e.rol(i.dest, e.cl);
+  }
+}
+struct ROTATE_LEFT_I8
+    : Sequence<ROTATE_LEFT_I8, I<OPCODE_ROTATE_LEFT, I8Op, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitRotateLeftXX<ROTATE_LEFT_I8, Reg8>(e, i);
+  }
+};
+struct ROTATE_LEFT_I16
+    : Sequence<ROTATE_LEFT_I16, I<OPCODE_ROTATE_LEFT, I16Op, I16Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitRotateLeftXX<ROTATE_LEFT_I16, Reg16>(e, i);
+  }
+};
+struct ROTATE_LEFT_I32
+    : Sequence<ROTATE_LEFT_I32, I<OPCODE_ROTATE_LEFT, I32Op, I32Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitRotateLeftXX<ROTATE_LEFT_I32, Reg32>(e, i);
+  }
+};
+struct ROTATE_LEFT_I64
+    : Sequence<ROTATE_LEFT_I64, I<OPCODE_ROTATE_LEFT, I64Op, I64Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitRotateLeftXX<ROTATE_LEFT_I64, Reg64>(e, i);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_ROTATE_LEFT, ROTATE_LEFT_I8, ROTATE_LEFT_I16,
+                     ROTATE_LEFT_I32, ROTATE_LEFT_I64);
+
+// ============================================================================
+// OPCODE_BYTE_SWAP
+// ============================================================================
+// TODO(benvanik): put dest/src1 together.
+struct BYTE_SWAP_I16
+    : Sequence<BYTE_SWAP_I16, I<OPCODE_BYTE_SWAP, I16Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitUnaryOp(
+        e, i, [](X64Emitter& e, const Reg16& dest_src) { e.ror(dest_src, 8); });
+  }
+};
+struct BYTE_SWAP_I32
+    : Sequence<BYTE_SWAP_I32, I<OPCODE_BYTE_SWAP, I32Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitUnaryOp(
+        e, i, [](X64Emitter& e, const Reg32& dest_src) { e.bswap(dest_src); });
+  }
+};
+struct BYTE_SWAP_I64
+    : Sequence<BYTE_SWAP_I64, I<OPCODE_BYTE_SWAP, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    EmitUnaryOp(
+        e, i, [](X64Emitter& e, const Reg64& dest_src) { e.bswap(dest_src); });
+  }
+};
+struct BYTE_SWAP_V128
+    : Sequence<BYTE_SWAP_V128, I<OPCODE_BYTE_SWAP, V128Op, V128Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    // TODO(benvanik): find a way to do this without the memory load.
+    e.vpshufb(i.dest, i.src1, e.GetXmmConstPtr(XMMByteSwapMask));
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_BYTE_SWAP, BYTE_SWAP_I16, BYTE_SWAP_I32,
+                     BYTE_SWAP_I64, BYTE_SWAP_V128);
+
+// ============================================================================
+// OPCODE_CNTLZ
+// Count leading zeroes
+// ============================================================================
+struct CNTLZ_I8 : Sequence<CNTLZ_I8, I<OPCODE_CNTLZ, I8Op, I8Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(CNTLZ_I8);
+  }
+};
+struct CNTLZ_I16 : Sequence<CNTLZ_I16, I<OPCODE_CNTLZ, I8Op, I16Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    assert_impossible_sequence(CNTLZ_I16);
+  }
+};
+struct CNTLZ_I32 : Sequence<CNTLZ_I32, I<OPCODE_CNTLZ, I8Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (e.IsFeatureEnabled(kX64EmitLZCNT)) {
+      e.lzcnt(i.dest.reg().cvt32(), i.src1);
+    } else {
+      Xbyak::Label end;
+      e.inLocalLabel();
+
+      e.bsr(e.eax, i.src1);  // ZF set if i.src1 is 0
+      e.mov(i.dest, 0x20);
+      e.jz(end);
+
+      e.xor_(e.eax, 0x1F);
+      e.mov(i.dest, e.al);
+
+      e.L(end);
+      e.outLocalLabel();
+    }
+  }
+};
+struct CNTLZ_I64 : Sequence<CNTLZ_I64, I<OPCODE_CNTLZ, I8Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (e.IsFeatureEnabled(kX64EmitLZCNT)) {
+      e.lzcnt(i.dest.reg().cvt64(), i.src1);
+    } else {
+      Xbyak::Label end;
+      e.inLocalLabel();
+
+      e.bsr(e.rax, i.src1);  // ZF set if i.src1 is 0
+      e.mov(i.dest, 0x40);
+      e.jz(end);
+
+      e.xor_(e.rax, 0x3F);
+      e.mov(i.dest, e.al);
+
+      e.L(end);
+      e.outLocalLabel();
+    }
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_CNTLZ, CNTLZ_I8, CNTLZ_I16, CNTLZ_I32, CNTLZ_I64);
+
+// ============================================================================
+// OPCODE_SET_ROUNDING_MODE
+// ============================================================================
+// Input: FPSCR (PPC format)
+
+struct SET_ROUNDING_MODE_I32
+    : Sequence<SET_ROUNDING_MODE_I32,
+               I<OPCODE_SET_ROUNDING_MODE, VoidOp, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    // The InstrEmit_'s that generate OPCODE_SET_ROUNDING_MODE mask it to RN
+    // so that it can be constant folded
+    if (i.src1.is_constant) {
+      unsigned constant_value = i.src1.constant();
+      e.mov(e.eax, mxcsr_table[constant_value]);
+      e.mov(e.dword[e.rsp + StackLayout::GUEST_SCRATCH], e.eax);
+      e.mov(e.GetBackendCtxPtr(offsetof(X64BackendContext, mxcsr_fpu)), e.eax);
+      e.vldmxcsr(e.dword[e.rsp + StackLayout::GUEST_SCRATCH]);
+
+    } else {
+      e.mov(e.ecx, i.src1);
+      e.mov(e.rax, uintptr_t(mxcsr_table));
+      e.mov(e.edx, e.ptr[e.rax + e.rcx * 4]);
+      // this was not here
+      e.mov(e.GetBackendCtxPtr(offsetof(X64BackendContext, mxcsr_fpu)), e.edx);
+
+      e.vldmxcsr(e.GetBackendCtxPtr(offsetof(X64BackendContext, mxcsr_fpu)));
+    }
+    e.ChangeMxcsrMode(MXCSRMode::Fpu, true);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_SET_ROUNDING_MODE, SET_ROUNDING_MODE_I32);
+
+static void MaybeYieldForwarder(void* ctx) { xe::threading::MaybeYield(); }
+// ============================================================================
+// OPCODE_DELAY_EXECUTION
+// ============================================================================
+struct DELAY_EXECUTION
+    : Sequence<DELAY_EXECUTION, I<OPCODE_DELAY_EXECUTION, VoidOp>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    // todo: what if they dont have smt?
+    if (cvars::delay_via_maybeyield) {
+      e.CallNativeSafe((void*)MaybeYieldForwarder);
+    } else {
+      e.pause();
+    }
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_DELAY_EXECUTION, DELAY_EXECUTION);
+// Include anchors to other sequence sources so they get included in the build.
+extern volatile int anchor_control;
+static int anchor_control_dest = anchor_control;
+
+extern volatile int anchor_memory;
+static int anchor_memory_dest = anchor_memory;
+
+extern volatile int anchor_vector;
+static int anchor_vector_dest = anchor_vector;
+
+static const char* KeyTypeName(uint32_t type) {
+  switch (type) {
+    case KEY_TYPE_X:
+      return "-";
+    case KEY_TYPE_L:
+      return "label";
+    case KEY_TYPE_O:
+      return "offset";
+    case KEY_TYPE_S:
+      return "symbol";
+    case KEY_TYPE_V_I8:
+      return "i8";
+    case KEY_TYPE_V_I16:
+      return "i16";
+    case KEY_TYPE_V_I32:
+      return "i32";
+    case KEY_TYPE_V_I64:
+      return "i64";
+    case KEY_TYPE_V_F32:
+      return "f32";
+    case KEY_TYPE_V_F64:
+      return "f64";
+    case KEY_TYPE_V_V128:
+      return "v128";
+    default:
+      return "?";
+  }
+}
+
+std::string FormatSequenceKey(uint64_t key) {
+  const InstrKey decoded(hir::SequenceSampleBackendKey(key));
+  std::string result = GetOpcodeName(static_cast<Opcode>(decoded.opcode));
+  // Space separated so the rendered label stays free of commas and the CSV
+  // column can be split naively.
+  result += ' ';
+  result += KeyTypeName(decoded.dest);
+  const uint32_t srcs[3] = {decoded.src1, decoded.src2, decoded.src3};
+  for (uint32_t n = 0; n < 3; ++n) {
+    result += ' ';
+    if (hir::SequenceSampleSrcIsConstant(key, n)) {
+      result += 'c';
+    }
+    result += KeyTypeName(srcs[n]);
+  }
+  const uint16_t flags = hir::SequenceSampleFlags(key);
+  if (flags) {
+    char buffer[16];
+    std::snprintf(buffer, sizeof(buffer), " f%X",
+                  static_cast<unsigned int>(flags));
+    result += buffer;
+  }
+  return result;
+}
+
+// The emitted code reads a stale register in place of the constant.
+static void ReportConstantReadAsReg(const X64Emitter& e, const Instr* i,
+                                    const InstrKey& key) {
+  // The nearest SOURCE_OFFSET before it names the guest instruction.
+  uint32_t guest_address = 0;
+  for (const Instr* p = i; p;) {
+    if (p->GetOpcodeNum() == OPCODE_SOURCE_OFFSET) {
+      guest_address = static_cast<uint32_t>(p->src1.offset);
+      break;
+    }
+    p = p->prev ? p->prev
+                : (p->block->prev ? p->block->prev->instr_tail : nullptr);
+  }
+  static constexpr const char* kTypeNames[] = {"i8",  "i16", "i32", "i64",
+                                               "f32", "f64", "v128"};
+  auto describe = [](uint32_t key_type, const Value* value) -> std::string {
+    if (key_type < OPCODE_SIG_TYPE_V) {
+      return "-";
+    }
+    return fmt::format("{}{}", kTypeNames[key_type - OPCODE_SIG_TYPE_V],
+                       value->IsConstant() ? " const" : "");
+  };
+  XELOGE(
+      "x64: {} read a constant operand as a register in function {:08X} at "
+      "guest {:08X} (flags {:X}, src1 {}, src2 {}, src3 {})",
+      GetOpcodeName(i->opcode), e.current_guest_function(), guest_address,
+      i->flags, describe(key.src1, i->src1.value),
+      describe(key.src2, i->src2.value), describe(key.src3, i->src3.value));
+}
+
+bool SelectSequence(X64Emitter* e, const Instr* i, const Instr** new_tail) {
+  if ((i->backend_flags & INSTR_X64_FLAGS_ELIMINATED) != 0) {
+    // skip
+    *new_tail = i->next;
+    return true;
+  } else {
+    const InstrKey key(i);
+
+    auto& table = SequenceTable();
+    auto it = table.find(key);
+    if (it != table.end()) {
+      const size_t size_before = e->getSize();
+      constant_read_as_reg = false;
+      const bool emitted = it->second(*e, i, key);
+      if (constant_read_as_reg) {
+        ReportConstantReadAsReg(*e, i, key);
+      }
+      if (emitted) {
+        // Skip the bookkeeping opcodes: they carry no guest work, and
+        // SOURCE_OFFSET would otherwise charge the coverage counter's own
+        // code to the instruction it is counting.
+        const Opcode num = i->GetOpcodeNum();
+        if (num != OPCODE_SOURCE_OFFSET && num != OPCODE_COMMENT &&
+            num != OPCODE_NOP) {
+          e->RecordSequenceSample(
+              i, key.value, static_cast<uint32_t>(e->getSize() - size_before));
+        }
+        *new_tail = i->next;
+        return true;
+      }
+    }
+    XELOGE("No sequence match for variant {}", GetOpcodeName(i->opcode));
+    return false;
+  }
+}
+
+}  // namespace x64
+}  // namespace backend
+}  // namespace cpu
+}  // namespace xe

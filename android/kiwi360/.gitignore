@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright 2026 Kiwi360 Project
+# SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0
+
+# Build output
+build/
+.gradle/
+.kotlin/
+__pycache__/
+
+# Machine-specific (SDK path)
+local.properties
+
+# Native libraries: built by xenia-edge (build-edge-android/bin/Linux) and copied here
+app/src/main/jniLibs/**/*.so
+
+# Signing: the keystore and its passwords never go in the repository
+*.jks
+*.keystore
+keystore.properties

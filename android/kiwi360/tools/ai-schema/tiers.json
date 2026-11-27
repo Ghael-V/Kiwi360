@@ -1,0 +1,354 @@
+{
+ "_doc": "Tiers for the AI per-game settings. allow = the AI may change it; risky = only with a curated precedent on the server, shown as experimental; preference = the player's taste, never changed; never = the AI never changes it. Cvars missing here are never. See README.md.",
+ "schema_version": 1,
+ "app": [
+  {
+   "key": "draw_resolution_scale",
+   "type": "int",
+   "default": "1",
+   "ui_title": "Internal resolution",
+   "enum": [
+    {
+     "name": "1x (native)",
+     "value": 1
+    },
+    {
+     "name": "2x",
+     "value": 2
+    },
+    {
+     "name": "3x",
+     "value": 3
+    }
+   ],
+   "description": "Internal rendering resolution as a multiple of the game's own (draw_resolution_scale_x and _y). Higher is sharper and costs GPU time roughly with the pixel count; a few games show seams or broken post-processing above 1x."
+  },
+  {
+   "key": "kiwi_rtz_software_emulation",
+   "type": "bool",
+   "default": "false",
+   "ui_title": "Exact vertex rounding",
+   "description": "Emulates the Xenos round-toward-zero vertex shader arithmetic in software where results become indices, addresses or exports, on GPUs without it in hardware (Adreno, Mali). Fixes rare geometry spikes or missing objects at a GPU cost; most games look the same without it."
+  }
+ ],
+ "allow": [
+  "async_shader_compilation",
+  "async_shader_skip_draws",
+  "async_shader_vs_interpreter",
+  "clear_memory_page_state",
+  "depth_bias_shader_offset",
+  "depth_float24_convert_in_pixel_shader",
+  "depth_float24_round",
+  "direct_host_resolve",
+  "draw_resolution_scaled_texture_offsets",
+  "draw_resolution_scale_threshold",
+  "gpu_3d_to_2d_texture",
+  "memexport_await_pixel_exports",
+  "memexport_await_vertex_exports",
+  "occlusion_query",
+  "occlusion_query_full_counters",
+  "occlusion_query_viz",
+  "precise_interpolation",
+  "readback_resolve",
+  "readback_resolve_half_pixel_offset",
+  "resolve_resolution_scale_fill_half_pixel_offset",
+  "texture_point_snap",
+  "use_fuzzy_alpha_epsilon",
+  "value_convert_7e3_8888_reuse",
+  "window_offset_in_edram",
+  "xenos_sample_positions",
+  "anisotropic_override",
+  "depth_transfer_not_equal_test",
+  "spirv_fine_derivatives",
+  "non_seamless_cube_map",
+  "execute_unclipped_draw_vs_on_cpu",
+  "kiwi_async_submit",
+  "kiwi_batch_memexport_readback",
+  "kiwi_cache_constant_descriptor_sets",
+  "kiwi_cache_texture_descriptor_sets",
+  "kiwi_clamp_7e3_render_targets",
+  "kiwi_coalesce_memexport_barriers",
+  "kiwi_memexport_commit_on_guest_sync",
+  "kiwi_skip_unchanged_texture_reloads",
+  "kiwi_structured_forward_cf",
+  "kiwi_vs_primitive_expansion",
+  "kiwi_depth_unorm24_as_float32",
+  "kiwi_turnip_sysmem",
+  "kiwi_present_prerotate",
+  "kiwi_vulkan_queue_priority",
+  "vulkan_dynamic_rendering",
+  "disable_context_promotion",
+  "context_promote_vec128",
+  "use_fast_dot_product",
+  "accurate_vmx_denormal_flush",
+  "accurate_fpscr_status",
+  "enable_early_precompilation",
+  "disable_prefetch_and_cachecontrol",
+  "wfe_precise_sleep",
+  "ignore_thread_priorities",
+  "ignore_thread_affinities",
+  "use_dedicated_xma_thread",
+  "apu_max_queued_frames",
+  "storage_request_timing"
+ ],
+ "risky": [
+  "render_target_path",
+  "half_pixel_offset",
+  "texture_cache_memory_limit_soft",
+  "texture_cache_memory_limit_hard",
+  "occlusion_query_fake_lower_threshold",
+  "occlusion_query_fake_upper_threshold",
+  "kiwi_texture_upload_blit",
+  "memexport_enable",
+  "enable_host_buffer",
+  "shared_memory_zero_copy",
+  "kiwi_gpu_guest_ram",
+  "vulkan_sparse_shared_memory",
+  "vulkan_pipeline_creation_threads",
+  "ignore_trap_instructions",
+  "inline_mmio_access",
+  "emit_inline_mmio_checks",
+  "emit_mmio_aware_stores_for_recorded_exception_addresses",
+  "inline_loadclock",
+  "clock_no_scaling",
+  "clock_source_raw",
+  "writable_code_segments",
+  "elide_e0_check",
+  "a64_enable_host_guest_stack_synchronization",
+  "guest_scheduler",
+  "guest_scheduler_quantum_us",
+  "guest_scheduler_spin_quanta",
+  "apply_title_update",
+  "allow_avatar_initialization",
+  "xma_decoder",
+  "protect_zero",
+  "media_type"
+ ],
+ "preference": [
+  "kiwi_frame_gen",
+  "kiwi_frame_gen_target",
+  "kiwi_frame_gen_quality",
+  "framerate_limit",
+  "postprocess_antialiasing",
+  "postprocess_scaling_and_sharpening",
+  "postprocess_ffx_cas_additional_sharpness",
+  "postprocess_ffx_fsr_sharpness_reduction",
+  "postprocess_ffx_fsr_max_upsampling_passes",
+  "postprocess_dither",
+  "present_letterbox",
+  "present_safe_area_x",
+  "present_safe_area_y",
+  "user_language",
+  "user_country",
+  "license_mask",
+  "volume",
+  "vibration",
+  "widescreen",
+  "use_50Hz_mode",
+  "video_standard",
+  "kernel_display_gamma_type",
+  "show_achievement_notification",
+  "kiwi_console_name",
+  "kiwi_default_gamertag",
+  "kiwi_post_effects"
+ ],
+ "never_reasons": {
+  "alu_round_toward_zero": "chosen from the GPU; kiwi_rtz_software_emulation is the per-game switch",
+  "guest_display_refresh_cap": "measured useless for headroom; unlimited vblanks break game timing",
+  "store_shaders": "shader cache, no per-game effect besides stutter",
+  "no_reserved_ops": "test for races, breaks games",
+  "no_round_to_single": "breaks games",
+  "permit_float_constant_evaluation": "breaks game maths",
+  "time_scalar": "changes game speed",
+  "kiwi_auto_disc_swap": "disc handling, not a compatibility switch",
+  "kiwi_auto_sign_in": "profile handling",
+  "kiwi_compose_ui": "frontend windows",
+  "kiwi_export_title_metadata": "library metadata",
+  "kiwi_debug_base_level_only": "debugging aid",
+  "kiwi_debug_native_transcendentals": "measurement only, not exact",
+  "kiwi_debug_rt_init_color": "debugging aid",
+  "kiwi_debug_skip_gpu_texture_reload": "measurement only, wrong output",
+  "kiwi_debug_skip_memexport_in_shaders": "measurement only, wrong output",
+  "kiwi_debug_skip_rt_transfers": "measurement only, wrong output",
+  "kiwi_debug_tfetch": "debugging aid",
+  "kiwi_auto_log_slow_frames": "logging",
+  "kiwi_dump_frame_textures": "debug dump",
+  "kiwi_renderdoc": "debug capture",
+  "kiwi_vulkan_driver_env": "driver debugging",
+  "vulkan_validation": "debugging, very slow",
+  "force_convert_triangle_strips_to_lists": "diagnosis",
+  "debug_msaa_2x_as_4x": "scalability testing",
+  "ignore_32bit_vertex_index_support": "downlevel testing",
+  "spirv_no_contraction_all": "diagnosis",
+  "spirv_disable_rounding_mode_rte": "RenderDoc aid",
+  "texture_dump": "debug dump",
+  "log_draws": "logging"
+ },
+ "types": {
+  "anisotropic_override": {
+   "type": "int",
+   "enum": [
+    {
+     "name": "No override",
+     "value": -1
+    },
+    {
+     "name": "Off",
+     "value": 0
+    },
+    {
+     "name": "1x",
+     "value": 1
+    },
+    {
+     "name": "2x",
+     "value": 2
+    },
+    {
+     "name": "4x",
+     "value": 3
+    },
+    {
+     "name": "8x",
+     "value": 4
+    },
+    {
+     "name": "16x",
+     "value": 5
+    }
+   ]
+  },
+  "draw_resolution_scale_threshold": {
+   "type": "int",
+   "min": 0,
+   "max": 640
+  },
+  "kiwi_depth_unorm24_as_float32": {
+   "type": "int",
+   "enum": [
+    {
+     "name": "Automatic (test the driver)",
+     "value": -1
+    },
+    {
+     "name": "Native D24S8",
+     "value": 0
+    },
+    {
+     "name": "Always float32",
+     "value": 1
+    }
+   ]
+  },
+  "kiwi_turnip_sysmem": {
+   "type": "int",
+   "enum": [
+    {
+     "name": "Automatic",
+     "value": -1
+    },
+    {
+     "name": "Turnip's own choice",
+     "value": 0
+    },
+    {
+     "name": "Always sysmem",
+     "value": 1
+    }
+   ]
+  },
+  "occlusion_query": {
+   "type": "string",
+   "values": [
+    "strict",
+    "fast",
+    "fast-alt",
+    "fake"
+   ]
+  },
+  "kiwi_vulkan_queue_priority": {
+   "type": "string",
+   "values": [
+    "auto",
+    "default",
+    "low",
+    "medium",
+    "high",
+    "realtime"
+   ]
+  },
+  "render_target_path": {
+   "type": "string",
+   "values": [
+    "performance",
+    "accuracy"
+   ]
+  },
+  "xma_decoder": {
+   "type": "string",
+   "values": [
+    "new",
+    "old",
+    "master"
+   ]
+  },
+  "media_type": {
+   "type": "string",
+   "values": [
+    "auto",
+    "hdd",
+    "odd"
+   ]
+  },
+  "apu_max_queued_frames": {
+   "type": "int",
+   "min": 4,
+   "max": 64
+  },
+  "texture_cache_memory_limit_soft": {
+   "type": "int",
+   "min": 128,
+   "max": 2048
+  },
+  "texture_cache_memory_limit_hard": {
+   "type": "int",
+   "min": 256,
+   "max": 4096
+  },
+  "occlusion_query_fake_lower_threshold": {
+   "type": "int",
+   "min": -1,
+   "max": 1000
+  },
+  "occlusion_query_fake_upper_threshold": {
+   "type": "int",
+   "min": -1,
+   "max": 1000
+  },
+  "vulkan_pipeline_creation_threads": {
+   "type": "int",
+   "min": -1,
+   "max": 8
+  },
+  "guest_scheduler_quantum_us": {
+   "type": "int",
+   "min": 100,
+   "max": 10000
+  },
+  "guest_scheduler_spin_quanta": {
+   "type": "int",
+   "min": 0,
+   "max": 64
+  },
+  "shared_memory_zero_copy": {
+   "type": "bool",
+   "default": "true"
+  }
+ },
+ "descriptions": {
+  "kiwi_turnip_sysmem": "With a custom Turnip driver (Lemon-Ade), render in sysmem mode instead of GMEM tiles (TU_DEBUG=sysmem). Automatic turns it on for Adreno 8xx, where GMEM hangs the GPU in Halo 4 and Forza 4 and sysmem costs nothing measurable. No effect on the system driver.",
+  "kiwi_vulkan_queue_priority": "Global priority asked for the graphics queue. auto requests none (as default). realtime puts the emulator in the GPU's top ring: fewer preemptions on Turnip, but the app's own UI can stall behind it and Android may report the app as not responding. high preempts more than default on the Adreno 830.",
+  "occlusion_query": "Occlusion query mode for EVENT_WRITE_ZPD (lens flares, culling, auto exposure). strict waits for the real GPU result (default, most accurate); fast and fast-alt don't wait and use a cached result; fake writes a fixed result without asking the GPU. fast or fake can help games that stall on queries.",
+  "depth_transfer_not_equal_test": "Use the not-equal depth test when copying depth between render targets. Off fixes some wrong depth after transfers (GTA V light-cone wedges on Adreno) at a small cost."
+ }
+}

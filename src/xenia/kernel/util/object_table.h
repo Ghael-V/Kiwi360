@@ -1,0 +1,136 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2020 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+#ifndef XENIA_KERNEL_UTIL_OBJECT_TABLE_H_
+#define XENIA_KERNEL_UTIL_OBJECT_TABLE_H_
+
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "xenia/base/mutex.h"
+#include "xenia/base/string_key.h"
+#include "xenia/kernel/xobject.h"
+#include "xenia/xbox.h"
+
+namespace xe {
+class ByteStream;
+}  // namespace xe
+
+namespace xe {
+namespace kernel {
+namespace util {
+
+class ObjectTable {
+ public:
+  ObjectTable();
+  ~ObjectTable();
+
+  void Reset();
+
+  // force_guest_handle puts a host object's new handle in the guest table, for
+  // the paths that hand one to the guest.
+  X_STATUS AddHandle(XObject* object, X_HANDLE* out_handle,
+                     bool force_guest_handle = false);
+  X_STATUS DuplicateHandle(X_HANDLE orig, X_HANDLE* out_handle);
+  X_STATUS RetainHandle(X_HANDLE handle);
+  X_STATUS ReleaseHandle(X_HANDLE handle);
+  X_STATUS ReleaseHandleInLock(X_HANDLE handle);
+  X_STATUS RemoveHandle(X_HANDLE handle);
+
+  bool Save(ByteStream* stream);
+  bool Restore(ByteStream* stream);
+
+  // Restores a XObject reference with a handle. Mainly for internal use - do
+  // not use.
+  X_STATUS RestoreHandle(X_HANDLE handle, XObject* object);
+  template <typename T>
+  object_ref<T> LookupObject(X_HANDLE handle, bool already_locked = false) {
+    auto object = LookupObject(handle, already_locked);
+    if (object) {
+      if (object->type() != T::kObjectType) {
+        object->Release();
+        return object_ref<T>();
+      }
+    }
+    auto result = object_ref<T>(reinterpret_cast<T*>(object));
+    return result;
+  }
+
+  X_STATUS AddNameMapping(const std::string_view name, X_HANDLE handle);
+  bool IsNameMappedTo(const std::string_view name, X_HANDLE handle);
+  void RemoveNameMapping(const std::string_view name);
+  X_STATUS GetObjectByName(const std::string_view name, X_HANDLE* out_handle);
+  template <typename T>
+  std::vector<object_ref<T>> GetObjectsByType(XObject::Type type) {
+    std::vector<object_ref<T>> results;
+    GetObjectsByType(
+        type, reinterpret_cast<std::vector<object_ref<XObject>>*>(&results));
+    return results;
+  }
+
+  template <typename T>
+  std::vector<object_ref<T>> GetObjectsByType() {
+    std::vector<object_ref<T>> results;
+    GetObjectsByType(
+        T::kObjectType,
+        reinterpret_cast<std::vector<object_ref<XObject>>*>(&results));
+    return results;
+  }
+
+  std::vector<object_ref<XObject>> GetAllObjects();
+  void PurgeAllObjects();  // Purges the object table of all guest objects
+
+  // The objects of the bodies CreateNative made, since a body that isn't a
+  // dispatcher has no room for the handle stashed in a dispatch header.
+  void AddAllocatedBody(uint32_t body, XObject* object);
+  void RemoveAllocatedBody(uint32_t body, const XObject* object);
+  // Null when |body| has no object or its last reference is gone.
+  object_ref<XObject> LookupAllocatedBody(uint32_t body);
+
+ private:
+  struct ObjectTableEntry {
+    int handle_ref_count = 0;
+    XObject* object = nullptr;
+  };
+  ObjectTableEntry* LookupTableInLock(X_HANDLE handle);
+  ObjectTableEntry* LookupTable(X_HANDLE handle);
+  XObject* LookupObject(X_HANDLE handle, bool already_locked);
+  void GetObjectsByType(XObject::Type type,
+                        std::vector<object_ref<XObject>>* results);
+
+  X_HANDLE TranslateHandle(X_HANDLE handle);
+  static constexpr uint32_t GetHandleSlot(X_HANDLE handle, bool host) {
+    handle &= host ? ~XObject::kHandleHostBase : ~XObject::kHandleBase;
+    return handle >> 2;
+  }
+  X_STATUS FindFreeSlot(uint32_t* out_slot, bool host, bool allow_zero);
+  bool Resize(uint32_t new_capacity, bool host);
+
+  xe::global_critical_region global_critical_region_;
+  uint32_t table_capacity_ = 0;
+  uint32_t host_table_capacity_ = 0;
+  ObjectTableEntry* table_ = nullptr;
+  ObjectTableEntry* host_table_ = nullptr;
+  uint32_t last_free_entry_ = 0;
+  uint32_t last_free_host_entry_ = 0;
+  std::unordered_map<string_key_case, X_HANDLE> name_table_;
+  std::unordered_map<uint32_t, XObject*> allocated_bodies_;
+};
+
+// Generic lookup
+template <>
+object_ref<XObject> ObjectTable::LookupObject<XObject>(X_HANDLE handle,
+                                                       bool already_locked);
+
+}  // namespace util
+}  // namespace kernel
+}  // namespace xe
+
+#endif  // XENIA_KERNEL_UTIL_OBJECT_TABLE_H_

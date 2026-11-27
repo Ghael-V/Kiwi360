@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-FileCopyrightText: Copyright 2026 Kiwi360 Project -->
+<!-- SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-feature
+        android:name="android.hardware.vulkan.version"
+        android:required="true"
+        android:version="0x401000" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Reading a title's saves as a ZIP (library provider, save_zip/): only Kiwi360
+         itself holds it. Other apps get a one-time grant through EXPORT_SAVES. -->
+    <permission
+        android:name="${applicationId}.permission.READ_SAVES"
+        android:protectionLevel="signature" />
+    <!-- Prototype: read dumps straight from ROMs/x360 on the SD card.
+         Granted over adb: appops set dev.kiwi360.proto MANAGE_EXTERNAL_STORAGE allow -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:extractNativeLibs="true"
+        android:usesCleartextTraffic="${cleartextAllowed}"
+        android:localeConfig="@xml/locales_config"
+        android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+
+        <profileable android:shell="true" />
+
+        <!-- The game library; games run in EmulatorActivity in the ":emu" process.
+             singleTop, not singleTask: as the task's root, a singleTask activity
+             started from the launcher icon finishes everything above it, so going
+             home and back through the icon ended the running game. -->
+        <activity
+            android:name="dev.kiwi360.frontend.LibraryActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar.Fullscreen"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Other apps open a game's options ("path" extra). -->
+            <intent-filter>
+                <action android:name="${applicationId}.OPEN_GAME_SETTINGS" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- Other apps (frontends) boot a game here: action dev.kiwi360.LAUNCH_GAME
+             with the game's absolute path in the "path" extra. Only the path is read,
+             so it never passes emulator settings on. Its own empty task affinity:
+             in the app's task, a second launch would match the task's root intent
+             (extras don't count) and only bring the running game to the front. -->
+        <activity
+            android:name="dev.kiwi360.frontend.ExternalLaunchActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="dev.kiwi360.LAUNCH_GAME" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- Other apps (and the game options) restore a title's saves from a ZIP:
+             action <applicationId>.IMPORT_SAVES, data its content:// URI. It
+             writes only after the user confirms on its own screen. Two filters:
+             one for a URI without a MIME type, one for a URI with one. -->
+        <activity
+            android:name="dev.kiwi360.frontend.ImportSavesActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar.Fullscreen"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode">
+            <intent-filter>
+                <action android:name="${applicationId}.IMPORT_SAVES" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="${applicationId}.IMPORT_SAVES" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+
+        <!-- Other apps ask for a copy of a title's saves: action
+             <applicationId>.EXPORT_SAVES, started for a result, "path" extra the
+             game file. The user agrees here; the result carries a one-time read
+             grant for save_zip/<TITLEID>. -->
+        <activity
+            android:name="dev.kiwi360.frontend.ExportSavesActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar.Fullscreen"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode">
+            <intent-filter>
+                <action android:name="${applicationId}.EXPORT_SAVES" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- Exported in debug builds only, so adb can boot a game directly with
+             cvar.* extras; in release builds only the library starts it.
+             Standard launch mode: GameLauncher starts it with NEW_TASK | CLEAR_TOP,
+             which finishes the instance already in the task and creates a new one
+             with the new game. As singleTask, an instance whose process was killed
+             in the background was recreated with its old intent (the old game). -->
+        <activity
+            android:name="jp.xenia.emulator.EmulatorActivity"
+            android:exported="${emulatorExported}"
+            android:process=":emu"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode" />
+
+        <!-- Read-only Title ID, name and icon of a game file other apps (frontends)
+             give the path of; never the library itself. -->
+        <provider
+            android:name="dev.kiwi360.frontend.library.TitleProvider"
+            android:authorities="${applicationId}.library"
+            android:exported="true">
+            <path-permission
+                android:pathPrefix="/save_zip/"
+                android:readPermission="${applicationId}.permission.READ_SAVES" />
+            <grant-uri-permission android:pathPrefix="/save_zip/" />
+        </provider>
+
+        <!-- Hands the zip built by "Share logs" to the app the user picks. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.logs"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/shared_logs_paths" />
+        </provider>
+
+    </application>
+
+</manifest>

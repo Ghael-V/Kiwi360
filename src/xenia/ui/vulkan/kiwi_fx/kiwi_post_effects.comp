@@ -1,0 +1,456 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kiwi360 Project
+// SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0
+
+// Kiwi360 post-processing effects chain: one compute pass per effect of the chain, from the
+// previous image (same size) to the next, the effect chosen by the push constant "effect".
+// Colours are the encoded (display) values. Colour maths runs at medium precision
+// (RelaxedPrecision: fp16 on Adreno), positions at high precision.
+
+#version 460 core
+
+precision mediump float;
+precision highp int;
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler linear_sampler;     // linear, clamp to edge
+layout(set = 0, binding = 1) uniform mediump texture2D source;  // previous image, same size
+layout(set = 0, binding = 2, rgba8) uniform writeonly image2D destination;
+
+layout(push_constant) uniform Push {
+    highp vec4 size;  // width, height, 1/width, 1/height (of source and destination)
+    highp vec4 time;  // seconds (wrapping at 3600), presented frame number, 0, 0
+    vec4 p0;          // effect parameters 0-3, in the effect table order
+    vec4 p1;          // parameters 4-7
+    int effect;       // which effect, see the ids below
+};
+
+const int kSharpen = 0;
+const int kBloom = 1;
+const int kBlur = 2;
+const int kCrt = 3;
+const int kScanlines = 4;
+const int kVignette = 5;
+const int kChroma = 6;
+const int kGrain = 7;
+const int kGrade = 8;
+const int kFilmic = 9;
+const int kLevels = 10;
+const int kSplit = 11;
+const int kDeband = 12;
+const int kDenoise = 13;
+const int kCartoon = 14;
+const int kCel = 15;
+const int kLens = 16;
+const int kPixelate = 17;
+const int kMono = 18;
+
+// Centre of the destination texel, normalized and in pixels (what the fragment shader versions
+// call uv and gl_FragCoord.xy).
+highp vec2 uv;
+highp vec2 frag_coord;
+
+// ---------------------------------------------------------------------------------------------
+// Helpers.
+
+vec3 Fetch(highp vec2 position) {
+    return textureLod(sampler2D(source, linear_sampler), position, 0.0).rgb;
+}
+
+// Texel at an offset in pixels.
+vec3 FetchOffset(highp vec2 position, highp vec2 pixels) {
+    return textureLod(sampler2D(source, linear_sampler), position + pixels * size.zw, 0.0).rgb;
+}
+
+float Luma(vec3 color) {
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// Output pixels per pixel of a 1080-line screen: sizes look the same at any resolution.
+highp float PixelScale() {
+    return size.y / 1080.0;
+}
+
+highp float Hash(highp vec2 p) {
+    highp vec3 q = fract(vec3(p.xyx) * 0.1031);
+    q += dot(q, q.yzx + 33.33);
+    return fract((q.x + q.y) * q.z);
+}
+
+// Ink outline shared by the cartoon effects: Sobel magnitude of the luma, 0 (no edge) to 1.
+float Outline(highp vec2 position, float threshold) {
+    const float tl = Luma(FetchOffset(position, vec2(-1.0, -1.0)));
+    const float t = Luma(FetchOffset(position, vec2(0.0, -1.0)));
+    const float tr = Luma(FetchOffset(position, vec2(1.0, -1.0)));
+    const float l = Luma(FetchOffset(position, vec2(-1.0, 0.0)));
+    const float r = Luma(FetchOffset(position, vec2(1.0, 0.0)));
+    const float bl = Luma(FetchOffset(position, vec2(-1.0, 1.0)));
+    const float b = Luma(FetchOffset(position, vec2(0.0, 1.0)));
+    const float br = Luma(FetchOffset(position, vec2(1.0, 1.0)));
+    const float gx = (tr + 2.0 * r + br) - (tl + 2.0 * l + bl);
+    const float gy = (bl + 2.0 * b + br) - (tl + 2.0 * t + tr);
+    const float magnitude = sqrt(gx * gx + gy * gy);
+    return smoothstep(threshold, threshold * 2.0 + 0.05, magnitude);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 0. Contrast-adaptive sharpening: a cross-shaped high-pass whose weight shrinks where the local
+// contrast is already high, so edges get crisper without halos. p0.x: amount (0-1).
+vec3 Sharpen() {
+    const vec3 e = Fetch(uv);
+    const vec3 b = FetchOffset(uv, vec2(0.0, -1.0));
+    const vec3 d = FetchOffset(uv, vec2(-1.0, 0.0));
+    const vec3 f = FetchOffset(uv, vec2(1.0, 0.0));
+    const vec3 h = FetchOffset(uv, vec2(0.0, 1.0));
+    const vec3 a = FetchOffset(uv, vec2(-1.0, -1.0));
+    const vec3 c = FetchOffset(uv, vec2(1.0, -1.0));
+    const vec3 g = FetchOffset(uv, vec2(-1.0, 1.0));
+    const vec3 i = FetchOffset(uv, vec2(1.0, 1.0));
+    // Soft minimum and maximum, 0-2: the cross, plus the whole 3x3 block.
+    const vec3 cross_min = min(min(min(b, d), min(f, h)), e);
+    const vec3 cross_max = max(max(max(b, d), max(f, h)), e);
+    const vec3 low = cross_min + min(cross_min, min(min(a, c), min(g, i)));
+    const vec3 high = cross_max + max(cross_max, max(max(a, c), max(g, i)));
+    // Headroom before clipping, relative to the local peak.
+    const vec3 amplitude = sqrt(clamp(min(low, 2.0 - high) / max(high, 1.0 / 64.0), 0.0, 1.0));
+    const float peak = -1.0 / mix(8.0, 4.5, clamp(p0.x, 0.0, 1.0));
+    const vec3 w = amplitude * peak;
+    return ((b + d + f + h) * w + e) / (1.0 + 4.0 * w);
+}
+
+// 1. Bloom: the bright parts, spread over a disc of taps around the pixel, added back as a glow.
+// p0: threshold (0-1), radius (% of the screen height), amount.
+const int kBloomTaps = 24;
+
+vec3 Bloom() {
+    const vec3 color = Fetch(uv);
+    const float threshold = clamp(p0.x, 0.0, 0.99);
+    const highp float radius = p0.y * 0.01 * size.y;
+    vec3 glow = vec3(0.0);
+    float total = 0.0;
+    for (int i = 0; i < kBloomTaps; i++) {
+        // Golden-angle spiral: evenly spread taps.
+        const highp float t = (float(i) + 0.5) / float(kBloomTaps);
+        const highp float angle = float(i) * 2.39996323;
+        const highp vec2 offset = vec2(cos(angle), sin(angle)) * sqrt(t) * radius;
+        const vec3 tap = FetchOffset(uv, offset);
+        const float bright = max(max(tap.r, tap.g), tap.b);
+        const float weight = 1.0 - 0.75 * float(t);
+        glow += tap * (max(bright - threshold, 0.0) / max(bright, 1.0 / 255.0)) * weight;
+        total += weight;
+    }
+    glow = glow / total * p0.z;
+    // Screen blend: highlights saturate towards white instead of clipping.
+    return 1.0 - (1.0 - color) * (1.0 - min(glow, 1.0));
+}
+
+// 2. Gaussian blur, optionally keeping a sharp centre (a depth-of-field look).
+// p0: radius (pixels at 1080p), strength (0-1), sharp centre size (0: none), centre falloff.
+vec3 Blur() {
+    const vec3 color = Fetch(uv);
+    float amount = clamp(p0.y, 0.0, 1.0);
+    if (p0.z > 0.0) {
+        const highp vec2 centred = (uv - 0.5) * vec2(size.x * size.w, 1.0);
+        const float distance = float(length(centred)) * 2.0;
+        amount *= smoothstep(p0.z, p0.z + max(p0.w, 0.01), distance);
+    }
+    if (amount <= 0.0) {
+        return color;
+    }
+    // 5x5 bilinear taps, spaced by half the radius.
+    const highp float spacing = max(p0.x, 0.5) * PixelScale() * 0.5;
+    vec3 sum = vec3(0.0);
+    float total = 0.0;
+    for (int y = -2; y <= 2; y++) {
+        for (int x = -2; x <= 2; x++) {
+            const float weight = exp(-0.5 * float(x * x + y * y) / 1.5);
+            sum += FetchOffset(uv, vec2(x, y) * spacing) * weight;
+            total += weight;
+        }
+    }
+    return mix(color, sum / total, amount);
+}
+
+// 3. CRT television: curved glass, colour bleed, scanlines, an aperture-grille mask and rounded
+// corners. p0: scanline strength, mask strength, curvature, line count; p1: bleed (pixels at
+// 1080p), roll speed (lines per second).
+vec3 Crt() {
+    // Barrel-curved screen.
+    const highp vec2 centred = uv - 0.5;
+    const highp vec2 curved = uv + centred * dot(centred, centred) * p0.z * 2.0;
+    if (any(lessThan(curved, vec2(0.0))) || any(greaterThan(curved, vec2(1.0)))) {
+        return vec3(0.0);
+    }
+    // Colour bleed: the beam smears along the line.
+    const highp float bleed = p1.x * PixelScale();
+    vec3 color = Fetch(curved) * 0.5;
+    color += FetchOffset(curved, vec2(-bleed, 0.0)) * 0.25;
+    color += FetchOffset(curved, vec2(bleed, 0.0)) * 0.25;
+
+    // Scanlines: brightest at the middle of each line, wider for bright pixels.
+    const highp float lines = max(p0.w, 16.0);
+    const highp float phase = fract(curved.y * lines + time.x * p1.y);
+    const float distance = abs(float(phase) - 0.5) * 2.0;
+    const float width = mix(0.65, 1.0, Luma(color));
+    const float beam = 1.0 - smoothstep(0.0, width, distance) * 0.85;
+    color *= mix(1.0, beam * 1.25, clamp(p0.x, 0.0, 1.0));
+
+    // Aperture grille: each output column passes one primary more than the others.
+    const int column = int(frag_coord.x) % 3;
+    const vec3 mask =
+        vec3(column == 0 ? 1.0 : 0.6, column == 1 ? 1.0 : 0.6, column == 2 ? 1.0 : 0.6);
+    color *= mix(vec3(1.0), mask * 1.2, clamp(p0.y, 0.0, 1.0));
+
+    // Rounded, darkened corners.
+    const highp vec2 edge = min(curved, 1.0 - curved) * vec2(size.x * size.w, 1.0);
+    color *= smoothstep(0.0, 0.02, float(min(edge.x, edge.y)));
+    return color;
+}
+
+// 4. Scanlines on a flat screen. p0: strength, line count, line thickness (0-1).
+vec3 Scanlines() {
+    const vec3 color = Fetch(uv);
+    const highp float phase = fract(uv.y * max(p0.y, 16.0));
+    const float distance = abs(float(phase) - 0.5) * 2.0;
+    const float thickness = clamp(p0.z, 0.05, 0.95);
+    const float dark = smoothstep(thickness - 0.15, thickness + 0.15, distance);
+    return color * (1.0 - clamp(p0.x, 0.0, 1.0) * dark);
+}
+
+// 5. Vignette: darker towards the corners. p0: strength, radius (1: the corners), softness.
+vec3 Vignette() {
+    const vec3 color = Fetch(uv);
+    const highp float aspect = size.x * size.w;
+    const highp vec2 centred = (uv - 0.5) * vec2(aspect, 1.0);
+    // 1 at the corners.
+    const float distance = float(length(centred) / length(vec2(aspect, 1.0) * 0.5));
+    const float softness = max(p0.z, 0.01);
+    const float shade = smoothstep(p0.y - softness, p0.y + softness * 0.5, distance);
+    return color * max(1.0 - p0.x * shade, 0.0);
+}
+
+// 6. Chromatic aberration: red and blue pulled apart towards the edges of the screen, as a cheap
+// lens does. p0: strength (pixels at the corners at 1080p), falloff (1: linear).
+vec3 Chroma() {
+    const highp vec2 centred = uv - 0.5;
+    const highp float distance = length(centred);
+    const float reach = pow(clamp(float(distance) * 1.41421356, 0.0, 1.0), max(p0.y, 0.1));
+    const highp vec2 offset = (distance > 0.0 ? centred / distance : vec2(0.0)) *
+                              (p0.x * reach * PixelScale()) * size.zw;
+    const float red = textureLod(sampler2D(source, linear_sampler), uv + offset, 0.0).r;
+    const float green = textureLod(sampler2D(source, linear_sampler), uv, 0.0).g;
+    const float blue = textureLod(sampler2D(source, linear_sampler), uv - offset, 0.0).b;
+    return vec3(red, green, blue);
+}
+
+// 7. Film grain: animated noise, strongest in the mid-tones. p0: intensity, grain size (pixels
+// at 1080p), colour (0: monochrome grain).
+vec3 Grain() {
+    const vec3 color = Fetch(uv);
+    const highp vec2 cell = floor(frag_coord / max(p0.y * PixelScale(), 1.0));
+    const highp float frame = mod(time.y, 4096.0);
+    const highp vec2 seed = cell + vec2(frame * 17.0, frame * 31.0);
+    const float mono = float(Hash(seed)) - 0.5;
+    const vec3 tint = vec3(Hash(seed + 7.13), Hash(seed + 3.71), Hash(seed + 5.37)) - 0.5;
+    const vec3 noise = mix(vec3(mono), tint, clamp(p0.z, 0.0, 1.0));
+    const float midtone = 1.0 - abs(Luma(color) * 2.0 - 1.0) * 0.6;
+    return color + noise * (p0.x * 2.0 * midtone);
+}
+
+// 8. Colour grading. p0: brightness, contrast, saturation, vibrance; p1: gamma, temperature
+// (warmer > 0), tint (magenta > 0).
+vec3 Grade() {
+    vec3 color = Fetch(uv) + p0.x;
+    color = (color - 0.5) * p0.y + 0.5;
+    const float luma = Luma(color);
+    color = mix(vec3(luma), color, p0.z);
+    // Vibrance: more saturation for the colours that have little.
+    const float chroma =
+        max(max(color.r, color.g), color.b) - min(min(color.r, color.g), color.b);
+    color = mix(vec3(luma), color, 1.0 + p0.w * (1.0 - clamp(chroma, 0.0, 1.0)));
+    color *= vec3(1.0 + 0.12 * p1.y + 0.05 * p1.z, 1.0 - 0.1 * p1.z,
+                  1.0 - 0.12 * p1.y + 0.05 * p1.z);
+    color = pow(max(color, 0.0), vec3(1.0 / max(p1.x, 0.05)));
+    return color;
+}
+
+// 9. Filmic tone curve: exposure, then an S-curve with separately shaped shadows (toe) and
+// highlights (shoulder), highlights rolled off instead of clipped. p0: exposure (stops), toe,
+// shoulder, amount.
+vec3 FilmicCurve(vec3 x, float toe, float shoulder) {
+    const vec3 low = 0.5 * pow(max(2.0 * x, 0.0), vec3(1.0 + toe));
+    const vec3 high = 1.0 - 0.5 * pow(max(2.0 * (1.0 - x), 0.0), vec3(1.0 + shoulder));
+    return mix(low, high, step(0.5, x));
+}
+
+vec3 Filmic() {
+    const vec3 color = Fetch(uv);
+    vec3 exposed = color * exp2(p0.x);
+    // Soft shoulder above 0.8, so overexposed parts keep some gradation.
+    const vec3 over = max(exposed - 0.8, 0.0);
+    exposed = min(exposed, 0.8) + 0.2 * (over / (over + 0.2));
+    return mix(color, FilmicCurve(clamp(exposed, 0.0, 1.0), p0.y, p0.z), clamp(p0.w, 0.0, 1.0));
+}
+
+// 10. Levels. p0: input black, input white, gamma, output black; p1.x: output white.
+vec3 Levels() {
+    vec3 color = (Fetch(uv) - p0.x) / max(p0.y - p0.x, 1.0 / 255.0);
+    color = pow(clamp(color, 0.0, 1.0), vec3(1.0 / max(p0.z, 0.05)));
+    return mix(vec3(p0.w), vec3(p1.x), color);
+}
+
+// 11. Split toning: one hue in the shadows, another in the highlights, brightness kept.
+// p0: shadow hue (degrees), shadow strength, highlight hue, highlight strength; p1.x: balance.
+vec3 SplitHue(float degrees) {
+    const vec3 rgb = clamp(
+        abs(fract(degrees / 360.0 + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0,
+        1.0);
+    return rgb - Luma(rgb);
+}
+
+vec3 Split() {
+    const vec3 color = Fetch(uv);
+    const float luma = clamp(Luma(color) + p1.x * 0.5, 0.0, 1.0);
+    const float shadows = (1.0 - luma) * (1.0 - luma);
+    const float highlights = luma * luma;
+    return color + SplitHue(p0.x) * (shadows * p0.y * 0.5) +
+           SplitHue(p0.z) * (highlights * p0.w * 0.5);
+}
+
+// 12. Debanding: where the neighbourhood is nearly flat, the pixel becomes the mean of four
+// random taps around it, then dithered. p0: threshold, radius (pixels at 1080p), dither.
+vec3 Deband() {
+    const vec3 color = Fetch(uv);
+    const highp float noise = Hash(frag_coord + mod(time.y, 64.0));
+    const highp float angle = noise * 6.2831853;
+    const highp float radius = (0.5 + 0.5 * Hash(frag_coord.yx)) * p0.y * PixelScale();
+    const highp vec2 a = vec2(cos(angle), sin(angle)) * radius;
+    const highp vec2 b = vec2(-a.y, a.x);
+    const vec3 t0 = FetchOffset(uv, a);
+    const vec3 t1 = FetchOffset(uv, -a);
+    const vec3 t2 = FetchOffset(uv, b);
+    const vec3 t3 = FetchOffset(uv, -b);
+    const vec3 spread =
+        max(max(abs(t0 - color), abs(t1 - color)), max(abs(t2 - color), abs(t3 - color)));
+    const bool flat_area = max(max(spread.r, spread.g), spread.b) < p0.x;
+    vec3 result = flat_area ? (t0 + t1 + t2 + t3) * 0.25 : color;
+    result += (float(noise) - 0.5) * (p0.z / 255.0);
+    return result;
+}
+
+// 13. Denoising: an edge-preserving (bilateral) average of the 5x5 neighbourhood without its
+// corners. p0: strength, radius (pixels at 1080p).
+vec3 Denoise() {
+    const vec3 color = Fetch(uv);
+    const float sigma = max(p0.x, 0.01) * 0.25;
+    const float range = -0.5 / (sigma * sigma);
+    const highp float spacing = max(p0.y, 0.5) * PixelScale() * 0.5;
+    vec3 sum = color;
+    float total = 1.0;
+    for (int y = -2; y <= 2; y++) {
+        for (int x = -2; x <= 2; x++) {
+            if ((x == 0 && y == 0) || (abs(x) == 2 && abs(y) == 2)) {
+                continue;
+            }
+            const vec3 tap = FetchOffset(uv, vec2(x, y) * spacing);
+            const vec3 delta = tap - color;
+            const float weight = exp(dot(delta, delta) * range - 0.25 * float(x * x + y * y));
+            sum += tap * weight;
+            total += weight;
+        }
+    }
+    return sum / total;
+}
+
+// 14. Cartoon: posterized colours with ink outlines. p0: outline strength, outline threshold,
+// colour levels, saturation.
+vec3 Cartoon() {
+    vec3 color = Fetch(uv);
+    color = mix(vec3(Luma(color)), color, p0.w);
+    const float levels = max(p0.z, 2.0) - 1.0;
+    color = floor(clamp(color, 0.0, 1.0) * levels + 0.5) / levels;
+    return color * (1.0 - clamp(Outline(uv, p0.y) * p0.x, 0.0, 1.0));
+}
+
+// 15. Cel shading: the lighting (luma) collapsed into flat bands with soft steps, hues kept, ink
+// outlines. p0: bands, band softness, outline strength, outline threshold; p1.x: saturation.
+vec3 Cel() {
+    vec3 color = Fetch(uv);
+    const float luma = Luma(color);
+    const float bands = max(p0.x, 2.0);
+    const float scaled = luma * bands;
+    const float soft = clamp(p0.y, 0.0, 1.0) * 0.5;
+    const float banded =
+        (floor(scaled) + smoothstep(0.5 - soft, 0.5 + soft, fract(scaled))) / bands;
+    color *= banded / max(luma, 1.0 / 255.0);
+    color = mix(vec3(Luma(color)), color, p1.x);
+    return color * (1.0 - clamp(Outline(uv, p0.w) * p0.z, 0.0, 1.0));
+}
+
+// 16. Lens distortion: barrel (> 0) or pincushion (< 0) distortion, with a zoom to fill the
+// screen. p0: distortion, zoom.
+vec3 Lens() {
+    const highp float aspect = size.x * size.w;
+    const highp vec2 centred = (uv - 0.5) * vec2(aspect, 1.0);
+    const highp float r2 = dot(centred, centred) / (0.25 * (aspect * aspect + 1.0));
+    const highp vec2 warped = centred * (1.0 + p0.x * r2) / max(p0.y, 0.1);
+    const highp vec2 position = warped / vec2(aspect, 1.0) + 0.5;
+    if (any(lessThan(position, vec2(0.0))) || any(greaterThan(position, vec2(1.0)))) {
+        return vec3(0.0);
+    }
+    return Fetch(position);
+}
+
+// 17. Pixelate: big square pixels. p0.x: pixel size (pixels at 1080p).
+vec3 Pixelate() {
+    const highp float cell = max(floor(p0.x * PixelScale() + 0.5), 1.0);
+    const highp vec2 position = (floor(frag_coord / cell) + 0.5) * cell * size.zw;
+    return Fetch(position);
+}
+
+// 18. Monochrome: grayscale, or sepia toning. p0: amount, sepia (0: grayscale).
+vec3 Mono() {
+    const vec3 color = Fetch(uv);
+    const vec3 gray = vec3(Luma(color));
+    const vec3 sepia =
+        vec3(dot(color, vec3(0.393, 0.769, 0.189)), dot(color, vec3(0.349, 0.686, 0.168)),
+             dot(color, vec3(0.272, 0.534, 0.131)));
+    return mix(color, mix(gray, sepia, clamp(p0.y, 0.0, 1.0)), clamp(p0.x, 0.0, 1.0));
+}
+
+// ---------------------------------------------------------------------------------------------
+
+void main() {
+    const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(vec2(texel), size.xy))) {
+        return;
+    }
+    frag_coord = vec2(texel) + 0.5;
+    uv = frag_coord * size.zw;
+
+    vec3 color;
+    // The effect id is dynamically uniform: the whole dispatch takes the same branch.
+    switch (effect) {
+        case kSharpen: color = Sharpen(); break;
+        case kBloom: color = Bloom(); break;
+        case kBlur: color = Blur(); break;
+        case kCrt: color = Crt(); break;
+        case kScanlines: color = Scanlines(); break;
+        case kVignette: color = Vignette(); break;
+        case kChroma: color = Chroma(); break;
+        case kGrain: color = Grain(); break;
+        case kGrade: color = Grade(); break;
+        case kFilmic: color = Filmic(); break;
+        case kLevels: color = Levels(); break;
+        case kSplit: color = Split(); break;
+        case kDeband: color = Deband(); break;
+        case kDenoise: color = Denoise(); break;
+        case kCartoon: color = Cartoon(); break;
+        case kCel: color = Cel(); break;
+        case kLens: color = Lens(); break;
+        case kPixelate: color = Pixelate(); break;
+        case kMono: color = Mono(); break;
+        default: color = Fetch(uv); break;  // Unknown effect: copy the source.
+    }
+    imageStore(destination, texel, vec4(clamp(color, 0.0, 1.0), 1.0));
+}

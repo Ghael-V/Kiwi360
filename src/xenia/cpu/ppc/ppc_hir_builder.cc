@@ -1,0 +1,858 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2021 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+#include "xenia/cpu/ppc/ppc_hir_builder.h"
+
+#include <stddef.h>
+#include <algorithm>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "third_party/fmt/include/fmt/format.h"
+
+#include "xenia/base/byte_order.h"
+#include "xenia/base/cvar.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/memory.h"
+#include "xenia/base/profiling.h"
+#include "xenia/base/string.h"
+#include "xenia/cpu/cpu_flags.h"
+#include "xenia/cpu/hir/label.h"
+#include "xenia/cpu/ppc/ppc_context.h"
+#include "xenia/cpu/ppc/ppc_decode_data.h"
+#include "xenia/cpu/ppc/ppc_frontend.h"
+#include "xenia/cpu/ppc/ppc_opcode_info.h"
+#include "xenia/cpu/processor.h"
+#include "xenia/cpu/xex_module.h"
+DEFINE_bool(
+    break_on_unimplemented_instructions, true,
+    "Break to the host debugger (or crash if no debugger attached) if an "
+    "unimplemented PowerPC instruction is encountered.",
+    "CPU");
+
+namespace xe {
+namespace cpu {
+namespace ppc {
+
+// TODO(benvanik): remove when enums redefined.
+using namespace xe::cpu::hir;
+
+using xe::cpu::hir::Label;
+using xe::cpu::hir::TypeName;
+using xe::cpu::hir::Value;
+
+// The number of times each opcode has been translated.
+// Accumulated across the entire run.
+uint32_t opcode_translation_counts[static_cast<int>(PPCOpcode::kInvalid)] = {0};
+
+void DumpAllOpcodeCounts() {
+  StringBuffer sb;
+  sb.Append("Instruction translation counts:\n");
+  for (size_t i = 0; i < xe::countof(opcode_translation_counts); ++i) {
+    auto opcode = static_cast<PPCOpcode>(i);
+    auto& opcode_info = GetOpcodeInfo(opcode);
+    auto& disasm_info = GetOpcodeDisasmInfo(opcode);
+    auto translation_count = opcode_translation_counts[i];
+    if (translation_count) {
+      sb.AppendFormat("{:8d} : {}\n", translation_count, disasm_info.name);
+    }
+  }
+  fprintf(stdout, "%s", sb.to_string().c_str());
+  fflush(stdout);
+}
+
+PPCHIRBuilder::PPCHIRBuilder(PPCFrontend* frontend)
+    : HIRBuilder(), frontend_(frontend), comment_buffer_(4096) {}
+
+PPCHIRBuilder::~PPCHIRBuilder() = default;
+
+PPCBuiltins* PPCHIRBuilder::builtins() const { return frontend_->builtins(); }
+
+void PPCHIRBuilder::Reset() {
+  function_ = nullptr;
+  dynamic_code_ = false;
+  vscr_sat_observable_ = true;
+  track_fpscr_status_ = true;
+  start_address_ = 0;
+  instr_count_ = 0;
+  instr_offset_list_ = NULL;
+  label_list_ = NULL;
+  with_debug_info_ = false;
+  HIRBuilder::Reset();
+}
+
+bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
+  SCOPE_profile_cpu_f("cpu");
+
+  Module* module = function->module();
+  if (frontend_->processor()->KeepsContextStores(module)) {
+    set_attributes(attributes() | FUNCTION_ATTRIB_KEEP_CONTEXT_STORES);
+  }
+
+  function_ = function;
+  dynamic_code_ = frontend_->processor()->IsDynamicCode(module);
+  vscr_sat_observable_ = frontend_->processor()->vscr_sat_observable();
+  track_fpscr_status_ = cvars::accurate_fpscr_status;
+  start_address_ = function_->address();
+  // chrispy: i've seen this one happen, not sure why but i think from trying to
+  // precompile twice i've also seen ones with a start and end address that are
+  // the same...
+  assert_true(function_->address() <= function_->end_address());
+  instr_count_ = (function_->end_address() - function_->address()) / 4 + 1;
+
+  with_debug_info_ = (flags & EMIT_DEBUG_COMMENTS) == EMIT_DEBUG_COMMENTS;
+  if (with_debug_info_) {
+    CommentFormat("{} fn {:08X}-{:08X} {}", function_->module()->name().c_str(),
+                  function_->address(), function_->end_address(),
+                  function_->name().c_str());
+  }
+
+  // Allocate offset list.
+  // This is used to quickly map labels to instructions.
+  // The list is built as the instructions are traversed, with the values
+  // being the previous HIR Instr before the given instruction. An
+  // instruction may have a label assigned to it if it hasn't been hit
+  // yet.
+  size_t list_size = instr_count_ * sizeof(void*);
+  instr_offset_list_ = (Instr**)arena_->Alloc(list_size, alignof(void*));
+  label_list_ = (Label**)arena_->Alloc(list_size, alignof(void*));
+  std::memset(instr_offset_list_, 0, list_size);
+  std::memset(label_list_, 0, list_size);
+
+  // Always mark entry with label.
+  label_list_[0] = NewLabel();
+
+  uint32_t start_address = function_->address();
+  uint32_t end_address = function_->end_address();
+  for (uint32_t address = start_address, offset = 0; address <= end_address;
+       address += 4, offset++) {
+    uint32_t code = xe::load_and_swap<uint32_t>(module->TranslateCode(address));
+    auto opcode = LookupOpcode(code);
+    auto& opcode_info = GetOpcodeInfo(opcode);
+
+    // Mark label, if we were assigned one earlier on in the walk.
+    // We may still get a label, but it'll be inserted by LookupLabel
+    // as needed.
+    Label* label = label_list_[offset];
+    if (label) {
+      MarkLabel(label);
+    }
+
+    Instr* first_instr = 0;
+    if (with_debug_info_) {
+      if (label) {
+        AnnotateLabel(address, label);
+      }
+      comment_buffer_.Reset();
+      comment_buffer_.AppendHexUInt32(address);
+      comment_buffer_.Append(' ');
+      comment_buffer_.AppendHexUInt32(code);
+      comment_buffer_.Append(' ');
+      DisasmPPC(address, code, &comment_buffer_);
+      Comment(comment_buffer_);
+      first_instr = last_instr();
+    }
+
+    // Mark source offset for debugging.
+    // We could omit this if we never wanted to debug.
+    SourceOffset(address);
+    if (!first_instr) {
+      first_instr = last_instr();
+    }
+
+    // Stash instruction offset. It's either the SOURCE_OFFSET or the COMMENT.
+    instr_offset_list_[offset] = first_instr;
+
+    if (opcode == PPCOpcode::kInvalid) {
+      XELOGE("Invalid instruction {:08X} {:08X}", address, code);
+      Comment("INVALID!");
+      // TraceInvalidInstruction(i);
+      continue;
+    }
+    ++opcode_translation_counts[static_cast<int>(opcode)];
+
+    // Synchronize the PPC context as required.
+    // This will ensure all registers are saved to the PPC context before this
+    // instruction executes.
+    if (opcode_info.type == PPCOpcodeType::kSync) {
+      ContextBarrier();
+    }
+
+    MaybeBreakOnInstruction(address);
+
+    InstrData i;
+    i.address = address;
+    i.code = code;
+    i.opcode = opcode;
+    i.opcode_info = &opcode_info;
+    if (!opcode_info.emit || opcode_info.emit(*this, i)) {
+      auto& disasm_info = GetOpcodeDisasmInfo(opcode);
+      XELOGE(
+          "Unimplemented instr {:08X} {:08X} {} - report the game to Xenia "
+          "developers; to skip, disable break_on_unimplemented_instructions",
+          address, code, disasm_info.name);
+      Comment("UNIMPLEMENTED!");
+      if (cvars::break_on_unimplemented_instructions) {
+        DebugBreak();
+      }
+    }
+  }
+
+  // Dynamic code can end at a bl taken never to return, where what follows is
+  // another function or no code at all. If the bl returns after all, the
+  // instruction after it runs next. A branch there from deeper frames returns
+  // into this frame the same way, as the address maps to the branch.
+  if (dynamic_code_ &&
+      (xe::load_and_swap<uint32_t>(module->TranslateCode(end_address)) &
+       0xFC000001) == 0x48000001) {
+    SourceOffset(end_address + 4);
+    CallIndirect(LoadConstantUint64(end_address + 4), CALL_TAIL);
+  }
+
+  if (false) {
+    DumpAllOpcodeCounts();
+  }
+
+  return Finalize();
+}
+
+static const std::vector<uint32_t>& LogLrAddresses() {
+  static const std::vector<uint32_t> addresses = []() {
+    std::vector<uint32_t> out;
+    const std::string& spec = cvars::log_lr_at_instruction;
+    size_t pos = 0;
+    while (pos < spec.size()) {
+      size_t end = spec.find(',', pos);
+      if (end == std::string::npos) {
+        end = spec.size();
+      }
+      std::string token = spec.substr(pos, end - pos);
+      try {
+        out.push_back(uint32_t(std::stoull(token, nullptr, 0)));
+      } catch (const std::exception&) {
+        XELOGW("log_lr_at_instruction: ignoring '{}'", token);
+      }
+      pos = end + 1;
+    }
+    return out;
+  }();
+  return addresses;
+}
+
+void PPCHIRBuilder::MaybeBreakOnInstruction(uint32_t address) {
+  const auto& log_lr_addresses = LogLrAddresses();
+  if (std::find(log_lr_addresses.begin(), log_lr_addresses.end(), address) !=
+      log_lr_addresses.end()) {
+    Comment("--log-lr-at-instruction target");
+    CallExtern(builtins()->log_lr_handler);
+  }
+
+  if (address != cvars::break_on_instruction) {
+    return;
+  }
+
+  Comment("--break-on-instruction target");
+
+  if (cvars::break_condition_gpr < 0) {
+    DebugBreak();
+    return;
+  }
+
+  auto left = LoadGPR(cvars::break_condition_gpr);
+  auto right = LoadConstantUint64(cvars::break_condition_value);
+  if (cvars::break_condition_truncate) {
+    left = Truncate(left, INT32_TYPE);
+    right = Truncate(right, INT32_TYPE);
+  }
+
+  auto op = cvars::break_condition_op.c_str();
+  // TODO(rick): table?
+  if (xe_strcasecmp(op, "eq") == 0) {
+    TrapTrue(CompareEQ(left, right));
+  } else if (xe_strcasecmp(op, "ne") == 0) {
+    TrapTrue(CompareNE(left, right));
+  } else if (xe_strcasecmp(op, "slt") == 0) {
+    TrapTrue(CompareSLT(left, right));
+  } else if (xe_strcasecmp(op, "sle") == 0) {
+    TrapTrue(CompareSLE(left, right));
+  } else if (xe_strcasecmp(op, "sgt") == 0) {
+    TrapTrue(CompareSGT(left, right));
+  } else if (xe_strcasecmp(op, "sge") == 0) {
+    TrapTrue(CompareSGE(left, right));
+  } else if (xe_strcasecmp(op, "ult") == 0) {
+    TrapTrue(CompareULT(left, right));
+  } else if (xe_strcasecmp(op, "ule") == 0) {
+    TrapTrue(CompareULE(left, right));
+  } else if (xe_strcasecmp(op, "ugt") == 0) {
+    TrapTrue(CompareUGT(left, right));
+  } else if (xe_strcasecmp(op, "uge") == 0) {
+    TrapTrue(CompareUGE(left, right));
+  } else {
+    assert_always();
+  }
+}
+
+void PPCHIRBuilder::AnnotateLabel(uint32_t address, Label* label) {
+  // chrispy: label->name is unused, it would be nice to be able to remove the
+  // field and this code
+  char name_buffer[13];
+  auto format_result = fmt::format_to_n(name_buffer, 12, "loc_{:08X}", address);
+  name_buffer[format_result.size] = '\0';
+  label->name = (char*)arena_->Alloc(sizeof(name_buffer), 1);
+  memcpy(label->name, name_buffer, sizeof(name_buffer));
+}
+
+Function* PPCHIRBuilder::LookupFunction(uint32_t address) {
+  return frontend_->processor()->LookupFunction(address);
+}
+
+Label* PPCHIRBuilder::LookupLabel(uint32_t address) {
+  if (address < start_address_) {
+    return nullptr;
+  }
+  size_t offset = (address - start_address_) / 4;
+  if (offset >= instr_count_) {
+    return nullptr;
+  }
+  Label* label = label_list_[offset];
+  if (label) {
+    return label;
+  }
+  // No label. If we haven't yet hit the instruction in the walk
+  // then create a label. Otherwise, we must go back and insert
+  // the label.
+  label = NewLabel();
+  label_list_[offset] = label;
+  Instr* instr = instr_offset_list_[offset];
+  if (instr) {
+    if (instr->prev) {
+      // Insert label, breaking up existing instructions.
+      InsertLabel(label, instr->prev);
+    } else {
+      // Instruction is at the head of a block, so just add the label.
+      MarkLabel(label, instr->block);
+    }
+
+    // Annotate the label, as we won't do it later.
+    if (with_debug_info_) {
+      AnnotateLabel(address, label);
+    }
+  }
+  return label;
+}
+
+// Value* PPCHIRBuilder::LoadXER() {
+//}
+//
+// void PPCHIRBuilder::StoreXER(Value* value) {
+//}
+
+Value* PPCHIRBuilder::LoadLR() {
+  return LoadContext(offsetof(PPCContext, lr), INT64_TYPE);
+}
+
+void PPCHIRBuilder::StoreLR(Value* value) {
+  assert_true(value->type == INT64_TYPE);
+  StoreContext(offsetof(PPCContext, lr), value);
+}
+
+Value* PPCHIRBuilder::LoadCTR() {
+  return LoadContext(offsetof(PPCContext, ctr), INT64_TYPE);
+}
+
+void PPCHIRBuilder::StoreCTR(Value* value) {
+  assert_true(value->type == INT64_TYPE);
+  StoreContext(offsetof(PPCContext, ctr), value);
+}
+
+Value* PPCHIRBuilder::LoadCR() {
+  // All bits. This is expensive, but seems to be less used than the
+  // field-specific LoadCR.
+  Value* v = LoadCR(0);
+  for (int i = 1; i <= 7; ++i) {
+    v = Or(v, LoadCR(i));
+  }
+  return v;
+}
+
+Value* PPCHIRBuilder::LoadCR(uint32_t n) {
+  // Construct the entire word of just the bits we care about.
+  // This makes it easier for the optimizer to exclude things, though
+  // we could be even more clever and watch sequences.
+  Value* v = Shl(ZeroExtend(LoadContext(offsetof(PPCContext, cr0) + (4 * n) + 0,
+                                        INT8_TYPE),
+                            INT64_TYPE),
+                 4 * (7 - n) + 3);
+  v = Or(v, Shl(ZeroExtend(LoadContext(offsetof(PPCContext, cr0) + (4 * n) + 1,
+                                       INT8_TYPE),
+                           INT64_TYPE),
+                4 * (7 - n) + 2));
+  v = Or(v, Shl(ZeroExtend(LoadContext(offsetof(PPCContext, cr0) + (4 * n) + 2,
+                                       INT8_TYPE),
+                           INT64_TYPE),
+                4 * (7 - n) + 1));
+  v = Or(v, Shl(ZeroExtend(LoadContext(offsetof(PPCContext, cr0) + (4 * n) + 3,
+                                       INT8_TYPE),
+                           INT64_TYPE),
+                4 * (7 - n) + 0));
+  return v;
+}
+
+Value* PPCHIRBuilder::LoadCRField(uint32_t n, uint32_t bit) {
+  return LoadContext(offsetof(PPCContext, cr0) + (4 * n) + bit, INT8_TYPE);
+}
+
+void PPCHIRBuilder::StoreCR(Value* value) {
+  // All bits. This is expensive, but seems to be less used than the
+  // field-specific StoreCR.
+  for (int i = 0; i <= 7; ++i) {
+    StoreCR(i, value);
+  }
+}
+
+void PPCHIRBuilder::StoreCR(uint32_t n, Value* value) {
+  // Pull out the bits we are interested in.
+  // Optimization passes will kill any unneeded stores (mostly).
+  StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 0,
+               And(Truncate(Shr(value, 4 * (7 - n) + 3), INT8_TYPE),
+                   LoadConstantUint8(1)));
+  StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 1,
+               And(Truncate(Shr(value, 4 * (7 - n) + 2), INT8_TYPE),
+                   LoadConstantUint8(1)));
+  StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 2,
+               And(Truncate(Shr(value, 4 * (7 - n) + 1), INT8_TYPE),
+                   LoadConstantUint8(1)));
+  StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 3,
+               And(Truncate(Shr(value, 4 * (7 - n) + 0), INT8_TYPE),
+                   LoadConstantUint8(1)));
+}
+
+void PPCHIRBuilder::StoreCRField(uint32_t n, uint32_t bit, Value* value) {
+  StoreContext(offsetof(PPCContext, cr0) + (4 * n) + bit, value);
+
+  // TODO(benvanik): trace CR.
+}
+
+void PPCHIRBuilder::UpdateCR(uint32_t n, Value* lhs, bool is_signed) {
+  UpdateCR(n, Truncate(lhs, INT32_TYPE), LoadZeroInt32(), is_signed);
+}
+
+void PPCHIRBuilder::UpdateCR(uint32_t n, Value* lhs, Value* rhs,
+                             bool is_signed) {
+  if (is_signed) {
+    Value* lt = CompareSLT(lhs, rhs);
+    StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 0, lt);
+    Value* gt = CompareSGT(lhs, rhs);
+    StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 1, gt);
+  } else {
+    Value* lt = CompareULT(lhs, rhs);
+    StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 0, lt);
+    Value* gt = CompareUGT(lhs, rhs);
+    StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 1, gt);
+  }
+  Value* eq = CompareEQ(lhs, rhs);
+  StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 2, eq);
+
+  // A snapshot of XER[SO], so it cannot be resolved lazily at mfcr time.
+  StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 3,
+               LoadContext(offsetof(PPCContext, xer_so), INT8_TYPE));
+
+  // TOOD(benvanik): trace CR.
+}
+
+void PPCHIRBuilder::UpdateCR6(Value* src_value) {
+  // Testing for all 1's and all 0's.
+  // if (Rc) CR6 = all_equal | 0 | none_equal | 0
+
+  // chrispy: nothing seems to write cr6_1, figure out if no documented
+  // instructions write anything other than 0 to it and remove these stores if
+  // so
+  StoreContext(offsetof(PPCContext, cr6.cr6_1), LoadZeroInt8());
+  StoreContext(offsetof(PPCContext, cr6.cr6_3), LoadZeroInt8());
+  StoreContext(offsetof(PPCContext, cr6.cr6_all_equal),
+               VectorAllSet(src_value));
+  StoreContext(offsetof(PPCContext, cr6.cr6_none_equal),
+               VectorNoneSet(src_value));
+
+  // TOOD(benvanik): trace CR.
+}
+
+Value* PPCHIRBuilder::LoadFPSCR() {
+  return LoadContext(offsetof(PPCContext, fpscr), INT32_TYPE);
+}
+
+void PPCHIRBuilder::StoreFPSCR(Value* value) {
+  assert_true(value->type == INT32_TYPE);
+  StoreContext(offsetof(PPCContext, fpscr), value);
+}
+
+// Writes FX, FEX, VX and OX, the four bits CR1 mirrors. FEX needs the exception
+// enable bits, which nothing sets, so it stays zero.
+void PPCHIRBuilder::StoreFPSCRSummary(Value* raised, bool update_cr1) {
+  // FX summarizes every exception, not just the invalid ones.
+  Value* fx = IsTrue(raised);
+  Value* vx = IsTrue(And(raised, LoadConstantUint32(FP_EXCEPTION_INVALID)));
+  Value* ox = IsTrue(And(raised, LoadConstantUint32(FP_EXCEPTION_OVERFLOW)));
+
+  if (update_cr1) {
+    // Store into the CR1 field.
+    // We do this instead of just calling CopyFPSCRToCR1 so that we don't
+    // have to read back the bits and do shifting work.
+    StoreContext(offsetof(PPCContext, cr1.cr1_fx), fx);
+    StoreContext(offsetof(PPCContext, cr1.cr1_fex), LoadConstantInt8(0));
+    StoreContext(offsetof(PPCContext, cr1.cr1_vx), vx);
+    StoreContext(offsetof(PPCContext, cr1.cr1_ox), ox);
+  }
+
+  Value* new_bits = Or(Shl(ZeroExtend(fx, INT32_TYPE), 31),
+                       Or(Shl(ZeroExtend(vx, INT32_TYPE), 29),
+                          Shl(ZeroExtend(ox, INT32_TYPE), 28)));
+
+  // Hardware accumulates these until software clears them, but the host status
+  // is read per instruction, so each instruction keeps its own value.
+  Value* bits = LoadFPSCR();
+  bits = Or(And(bits, LoadConstantUint32(0x0FFFFFFF)), new_bits);
+  StoreFPSCR(bits);
+}
+
+bool PPCHIRBuilder::SkipFPSCRStatus(bool update_cr1) {
+  if (track_fpscr_status_) {
+    return false;
+  }
+  if (update_cr1) {
+    CopyFPSCRToCR1();
+  }
+  return true;
+}
+
+void PPCHIRBuilder::ClearFPSCRExceptions(bool update_cr1) {
+  if (SkipFPSCRStatus(update_cr1)) {
+    return;
+  }
+  StoreFPSCRSummary(LoadConstantUint32(0), update_cr1);
+}
+
+void PPCHIRBuilder::BeginFPSCRUpdate(bool update_cr1) {
+  if (update_cr1 && track_fpscr_status_) {
+    ClearFpExceptions();
+  }
+}
+
+// Magnitude of a double, for classifying it without a compare against a NaN.
+static Value* FpMagnitude(PPCHIRBuilder& f, Value* value) {
+  return f.And(f.Cast(value, INT64_TYPE),
+               f.LoadConstantUint64(0x7FFFFFFFFFFFFFFFull));
+}
+
+// Widens a 0/1 flag into one of the FpExceptionFlags bits.
+static Value* FpExceptionBit(PPCHIRBuilder& f, Value* flag, uint32_t bit) {
+  return f.Mul(f.ZeroExtend(flag, INT32_TYPE), f.LoadConstantUint32(bit));
+}
+
+static Value* FpIsSignalingNan(PPCHIRBuilder& f, Value* value) {
+  return f.And(f.IsNan(value),
+               f.IsFalse(f.And(f.Cast(value, INT64_TYPE),
+                               f.LoadConstantUint64(0x0008000000000000ull))));
+}
+
+// VXSNAN is unconditional on PPC, and the host cannot be relied on for it: the
+// a64 NaN walks quiet a signalling operand without a host exception.
+Value* PPCHIRBuilder::FpInvalidFromOperands(
+    std::initializer_list<Value*> operands) {
+  Value* any_snan = nullptr;
+  for (Value* operand : operands) {
+    Value* is_snan = FpIsSignalingNan(*this, operand);
+    any_snan = any_snan ? Or(any_snan, is_snan) : is_snan;
+  }
+  return any_snan;
+}
+
+void PPCHIRBuilder::UpdateFPSCR(std::initializer_list<Value*> operands,
+                                bool update_cr1, Value* suppress) {
+  if (SkipFPSCRStatus(update_cr1)) {
+    return;
+  }
+  if (!update_cr1) {
+    ClearFPSCRExceptions(false);
+    return;
+  }
+  Value* raised = Or(LoadFpExceptions(),
+                     FpExceptionBit(*this, FpInvalidFromOperands(operands),
+                                    FP_EXCEPTION_INVALID));
+  if (suppress) {
+    raised = Select(suppress, LoadConstantUint32(0), raised);
+  }
+  StoreFPSCRSummary(raised, true);
+}
+
+// An operand outside the single range, nonzero and below 2^-149 (denormal
+// doubles among them) or from 2^128 up, makes the single-precision add,
+// multiply and multiply-add answer with the default QNaN and raise nothing at
+// all; divide and square root keep the unrounded double instead. A NaN or
+// infinite operand takes precedence, so this asks for every operand finite and
+// at least one of them out of range.
+Value* PPCHIRBuilder::SingleOutOfRangeOperand(
+    std::initializer_list<Value*> operands) {
+  Value* ops[3] = {nullptr, nullptr, nullptr};
+  int count = 0;
+  for (Value* operand : operands) {
+    ops[count++] = operand;
+  }
+  assert_true(count >= 1 && count <= 3);
+  for (; count < 3; ++count) {
+    ops[count] = ops[count - 1];
+  }
+  return SingleRangeQuirk(ops[0], ops[1], ops[2]);
+}
+
+Value* PPCHIRBuilder::ApplySingleOutOfRangeOperand(Value* quirk,
+                                                   Value* result) {
+  return Select(quirk,
+                Cast(LoadConstantUint64(0x7FF8000000000000ull), FLOAT64_TYPE),
+                result);
+}
+
+uint32_t PPCHIRBuilder::SingleRangeFlag(bool update_cr1) const {
+  return update_cr1 ? 0 : ARITHMETIC_SINGLE_RANGE;
+}
+
+Value* PPCHIRBuilder::SnapshotFpExceptions(bool update_cr1) {
+  return (update_cr1 && track_fpscr_status_) ? LoadFpExceptions() : nullptr;
+}
+
+// The rounding to single never happened for an operand outside the single
+// range, so what it would have raised is not reported either. The host status
+// is cumulative, so the snapshot taken before it is the whole answer for that
+// case.
+void PPCHIRBuilder::UpdateFPSCRForUnroundedSingle(
+    std::initializer_list<Value*> operands, bool update_cr1, Value* quirk,
+    Value* before_rounding) {
+  if (SkipFPSCRStatus(update_cr1)) {
+    return;
+  }
+  if (!update_cr1) {
+    ClearFPSCRExceptions(false);
+    return;
+  }
+  Value* raised = Or(Select(quirk, before_rounding, LoadFpExceptions()),
+                     FpExceptionBit(*this, FpInvalidFromOperands(operands),
+                                    FP_EXCEPTION_INVALID));
+  StoreFPSCRSummary(raised, true);
+}
+
+void PPCHIRBuilder::UpdateFPSCRForMultiplyAdd(Value* a, Value* c, Value* b,
+                                              bool update_cr1,
+                                              Value* suppress) {
+  if (SkipFPSCRStatus(update_cr1)) {
+    return;
+  }
+  if (!update_cr1) {
+    ClearFPSCRExceptions(false);
+    return;
+  }
+  // IEEE lets an implementation skip the invalid signal for 0 x inf when the
+  // addend is a quiet NaN, and x86 skips it where the Xenon signals it, so
+  // recover that one case from the multiplicands.
+  Value* inf = LoadConstantUint64(0x7FF0000000000000ull);
+  Value* a_zero = IsFalse(FpMagnitude(*this, a));
+  Value* c_zero = IsFalse(FpMagnitude(*this, c));
+  Value* a_inf = CompareEQ(FpMagnitude(*this, a), inf);
+  Value* c_inf = CompareEQ(FpMagnitude(*this, c), inf);
+  Value* invalid = Or(FpInvalidFromOperands({a, c, b}),
+                      Or(And(a_zero, c_inf), And(a_inf, c_zero)));
+
+  Value* raised = Or(LoadFpExceptions(),
+                     FpExceptionBit(*this, invalid, FP_EXCEPTION_INVALID));
+  if (suppress) {
+    raised = Select(suppress, LoadConstantUint32(0), raised);
+  }
+  StoreFPSCRSummary(raised, true);
+}
+
+void PPCHIRBuilder::UpdateFPSCRForEstimate(Value* b, bool is_sqrt_estimate,
+                                           bool update_cr1) {
+  if (SkipFPSCRStatus(update_cr1)) {
+    return;
+  }
+  if (!update_cr1) {
+    ClearFPSCRExceptions(false);
+    return;
+  }
+  // The estimates never signal inexact, and the host approximations standing in
+  // for them signal nothing at all, so the operand is the only source.
+  Value* magnitude = FpMagnitude(*this, b);
+  Value* is_zero = IsFalse(magnitude);
+  Value* is_nan = IsNan(b);
+  Value* invalid = FpIsSignalingNan(*this, b);
+  if (is_sqrt_estimate) {
+    // A negative operand has no square root. Negative zero does, and a NaN
+    // propagates rather than signalling.
+    Value* is_negative =
+        IsTrue(And(Cast(b, INT64_TYPE), LoadConstantUint64(1ull << 63)));
+    invalid = Or(invalid, And(is_negative, IsFalse(Or(is_zero, is_nan))));
+  }
+  // A zero operand divides by zero, in the reciprocal and its square root
+  // alike.
+  Value* raised = Or(FpExceptionBit(*this, invalid, FP_EXCEPTION_INVALID),
+                     FpExceptionBit(*this, is_zero, FP_EXCEPTION_DIV_BY_ZERO));
+  if (!is_sqrt_estimate) {
+    // fres is single-precision, so the reciprocal of anything under 2^-128
+    // leaves its range. Zero is a divide rather than an overflow.
+    Value* overflows =
+        And(IsTrue(magnitude),
+            CompareULT(magnitude, LoadConstantUint64(0x37F0000000000000ull)));
+    raised =
+        Or(raised, FpExceptionBit(*this, overflows, FP_EXCEPTION_OVERFLOW));
+  }
+  StoreFPSCRSummary(raised, true);
+}
+
+void PPCHIRBuilder::UpdateFPSCRForConvertToInteger(Value* b,
+                                                   RoundMode round_mode,
+                                                   bool to_int64,
+                                                   bool update_cr1) {
+  if (SkipFPSCRStatus(update_cr1)) {
+    return;
+  }
+  if (!update_cr1) {
+    ClearFPSCRExceptions(false);
+    return;
+  }
+  // Invalid is what the target range cannot hold, measured on the rounded
+  // value: truncating 2^31 - 0.5 stays in range where rounding it up does
+  // not. The limit is the power of two just past the maximum, which leaves
+  // the minimum itself in range. A NaN's invalid comes from the conversion.
+  Value* rounded = Round(b, round_mode);
+  double limit = to_int64 ? 9223372036854775808.0 : 2147483648.0;
+  Value* out_of_range = Or(CompareSGE(rounded, LoadConstantFloat64(limit)),
+                           CompareSLT(rounded, LoadConstantFloat64(-limit)));
+  Value* raised = Or(LoadFpExceptions(),
+                     FpExceptionBit(*this, out_of_range, FP_EXCEPTION_INVALID));
+  StoreFPSCRSummary(raised, true);
+}
+
+void PPCHIRBuilder::CopyFPSCRToCR1() {
+  // Pull out of FPSCR.
+  Value* fpscr = LoadFPSCR();
+  StoreContext(offsetof(PPCContext, cr1.cr1_fx),
+               And(Truncate(Shr(fpscr, 31), INT8_TYPE), LoadConstantInt8(1)));
+  StoreContext(offsetof(PPCContext, cr1.cr1_fex),
+               And(Truncate(Shr(fpscr, 30), INT8_TYPE), LoadConstantInt8(1)));
+  StoreContext(offsetof(PPCContext, cr1.cr1_vx),
+               And(Truncate(Shr(fpscr, 29), INT8_TYPE), LoadConstantInt8(1)));
+  StoreContext(offsetof(PPCContext, cr1.cr1_ox),
+               And(Truncate(Shr(fpscr, 28), INT8_TYPE), LoadConstantInt8(1)));
+}
+
+// SO is bit 31, OV bit 30, CA bit 29 and the byte count bits 0-6.
+Value* PPCHIRBuilder::LoadXER() {
+  Value* v = Shl(ZeroExtend(LoadCA(), INT64_TYPE), 29);
+  v = Or(v, Shl(ZeroExtend(LoadContext(offsetof(PPCContext, xer_ov), INT8_TYPE),
+                           INT64_TYPE),
+                30));
+  v = Or(v, Shl(ZeroExtend(LoadContext(offsetof(PPCContext, xer_so), INT8_TYPE),
+                           INT64_TYPE),
+                31));
+  return Or(v, LoadXERCount());
+}
+
+void PPCHIRBuilder::StoreXER(Value* value) {
+  StoreCA(Truncate(And(Shr(value, 29), LoadConstantInt64(1)), INT8_TYPE));
+  StoreContext(offsetof(PPCContext, xer_ov),
+               Truncate(And(Shr(value, 30), LoadConstantInt64(1)), INT8_TYPE));
+  StoreContext(offsetof(PPCContext, xer_so),
+               Truncate(And(Shr(value, 31), LoadConstantInt64(1)), INT8_TYPE));
+  StoreContext(offsetof(PPCContext, xer_count),
+               Truncate(And(value, LoadConstantInt64(0x7F)), INT8_TYPE));
+}
+
+Value* PPCHIRBuilder::LoadXERCount() {
+  return ZeroExtend(LoadContext(offsetof(PPCContext, xer_count), INT8_TYPE),
+                    INT64_TYPE);
+}
+
+void PPCHIRBuilder::StoreOV(Value* value) {
+  assert_true(value->type == INT8_TYPE);
+  StoreContext(offsetof(PPCContext, xer_ov), value);
+  // Sticky until mtxer or mcrxr clears it.
+  StoreContext(offsetof(PPCContext, xer_so),
+               Or(LoadContext(offsetof(PPCContext, xer_so), INT8_TYPE), value));
+}
+
+Value* PPCHIRBuilder::LoadCA() {
+  return LoadContext(offsetof(PPCContext, xer_ca), INT8_TYPE);
+}
+
+void PPCHIRBuilder::StoreCA(Value* value) {
+  assert_true(value->type == INT8_TYPE);
+  StoreContext(offsetof(PPCContext, xer_ca), value);
+}
+
+Value* PPCHIRBuilder::LoadSAT() {
+  return LoadContext(offsetof(PPCContext, vscr_sat), INT8_TYPE);
+}
+
+void PPCHIRBuilder::StoreSAT(Value* value) {
+  value = Truncate(value, INT8_TYPE);
+  StoreContext(offsetof(PPCContext, vscr_sat), value);
+}
+
+Value* PPCHIRBuilder::LoadGPR(uint32_t reg) {
+  return LoadContext(offsetof(PPCContext, r) + reg * 8, INT64_TYPE);
+}
+
+void PPCHIRBuilder::StoreGPR(uint32_t reg, Value* value) {
+  assert_true(value->type == INT64_TYPE);
+  StoreContext(offsetof(PPCContext, r) + reg * 8, value);
+}
+
+Value* PPCHIRBuilder::LoadFPR(uint32_t reg) {
+  return LoadContext(offsetof(PPCContext, f) + reg * 8, FLOAT64_TYPE);
+}
+
+void PPCHIRBuilder::StoreFPR(uint32_t reg, Value* value) {
+  assert_true(value->type == FLOAT64_TYPE);
+  StoreContext(offsetof(PPCContext, f) + reg * 8, value);
+}
+
+Value* PPCHIRBuilder::LoadVR(uint32_t reg) {
+  return LoadContext(offsetof(PPCContext, v) + reg * 16, VEC128_TYPE);
+}
+
+void PPCHIRBuilder::StoreVR(uint32_t reg, Value* value) {
+  assert_true(value->type == VEC128_TYPE);
+  StoreContext(offsetof(PPCContext, v) + reg * 16, value);
+}
+
+void PPCHIRBuilder::SetReturnAddress(Value* value) {
+  /*
+     Record the address as being a possible target of a return. This is
+     needed for longjmp emulation. See x64_emitter.cc's ResolveFunction
+  */
+  Module* mod = this->function_->module();
+  if (value && value->IsConstant()) {
+    if (mod) {
+      XexModule* xexmod = dynamic_cast<XexModule*>(mod);
+      if (xexmod) {
+        auto flags = xexmod->GetInstructionAddressFlags(value->AsUint32());
+        if (flags) {
+          InfoCacheFlags bits{};
+          bits.is_return_site = true;
+          AtomicSetInfoCacheFlags(flags, bits);
+        }
+      }
+    }
+  }
+
+  HIRBuilder::SetReturnAddress(value);
+}
+}  // namespace ppc
+}  // namespace cpu
+}  // namespace xe

@@ -1,0 +1,291 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2024 Xenia Canary. All rights reserved.                          *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+#include "xenia/ui/profile_dialogs.h"
+
+#include <algorithm>
+#include <cfloat>
+
+#include "xenia/app/emulator_window.h"
+#include "xenia/base/png_utils.h"
+#include "xenia/base/system.h"
+#include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xam/xam_state.h"
+#include "xenia/kernel/xam/xam_ui.h"
+#include "xenia/ui/file_picker.h"
+#include "xenia/ui/imgui_host_notification.h"
+
+#include "xenia/kernel/xam/ui/create_profile_ui.h"
+#include "xenia/kernel/xam/ui/signin_ui.h"
+
+namespace xe {
+namespace app {
+
+void ProfileConfigDialog::LoadProfileIcon() {
+  if (!emulator_window_) {
+    return;
+  }
+
+  const auto profile_manager = emulator_window_->emulator()
+                                   ->kernel_state()
+                                   ->xam_state()
+                                   ->profile_manager();
+  if (!profile_manager) {
+    return;
+  }
+
+  for (const auto& [xuid, account] : *profile_manager->GetAccounts()) {
+    LoadProfileIcon(xuid);
+  }
+}
+
+void ProfileConfigDialog::LoadProfileIcon(const uint64_t xuid) {
+  if (!emulator_window_) {
+    return;
+  }
+
+  const auto profile_manager = emulator_window_->emulator()
+                                   ->kernel_state()
+                                   ->xam_state()
+                                   ->profile_manager();
+  if (!profile_manager) {
+    return;
+  }
+
+  const auto profile_icon = profile_manager->GetAccountIcon(xuid);
+
+  if (auto& current_icon = profile_icon_[xuid]; current_icon) {
+    released_icons_.push_back(std::move(current_icon));
+  }
+
+  profile_icon_[xuid] = profile_icon.empty()
+                            ? nullptr
+                            : imgui_drawer()->LoadImGuiIcon(profile_icon);
+}
+
+void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
+  if (!emulator_window_->emulator() ||
+      !emulator_window_->emulator()->kernel_state() ||
+      !emulator_window_->emulator()->kernel_state()->xam_state()) {
+    return;
+  }
+
+  auto profile_manager = emulator_window_->emulator()
+                             ->kernel_state()
+                             ->xam_state()
+                             ->profile_manager();
+  if (!profile_manager) {
+    return;
+  }
+
+  // Previous frame is already rendered, so these aren't referenced anymore.
+  released_icons_.clear();
+
+  auto profiles = profile_manager->GetAccounts();
+
+  // Center every frame, from the size the profile list settles at.
+  const ImGuiViewport* viewport = ImGui::GetMainViewport();
+  ImGui::SetNextWindowPos(viewport->GetWorkCenter(), ImGuiCond_Always,
+                          ImVec2(0.5f, 0.5f));
+
+  // Style like Xbox - white background, black text, Xbox green highlights
+  const ImVec4 xbox_green(0.063f, 0.486f, 0.063f, 1.0f);
+  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+  ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
+  ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+  ImGui::PushStyleColor(ImGuiCol_TitleBg, xbox_green);
+  ImGui::PushStyleColor(ImGuiCol_TitleBgActive, xbox_green);
+  ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.9f, 0.9f, 0.9f, 1.0f));
+  ImGui::PushStyleColor(ImGuiCol_ButtonHovered, xbox_green);
+  ImGui::PushStyleColor(ImGuiCol_ButtonActive, xbox_green);
+  ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.95f, 0.95f, 0.95f, 1.0f));
+  ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,
+                        ImVec4(0.9f, 0.9f, 0.9f, 1.0f));
+  ImGui::PushStyleColor(ImGuiCol_Header, xbox_green);
+  ImGui::PushStyleColor(ImGuiCol_HeaderHovered, xbox_green);
+  ImGui::PushStyleColor(ImGuiCol_HeaderActive, xbox_green);
+  ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+
+  bool dialog_open = true;
+  if (!ImGui::Begin("Profiles Menu", &dialog_open,
+                    ImGuiWindowFlags_NoCollapse |
+                        ImGuiWindowFlags_AlwaysAutoResize |
+                        ImGuiWindowFlags_HorizontalScrollbar)) {
+    ImGui::PopStyleVar(1);
+    ImGui::PopStyleColor(14);
+    ImGui::End();
+    return;
+  }
+
+  // Handle close button (X) clicked or B/Esc when no context menu is open
+  bool should_close = !dialog_open;
+  if (!should_close && !context_menu_open_) {
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape) || ShouldCloseFromGamepad()) {
+      should_close = true;
+    }
+  }
+  if (should_close) {
+    ImGui::PopStyleVar(1);
+    ImGui::PopStyleColor(14);
+    ImGui::End();
+    Close();
+    return;
+  }
+
+  // Reset context menu state - will be set to true if menu is drawn
+  context_menu_open_ = false;
+
+  if (profiles->empty()) {
+    ImGui::TextUnformatted("No profiles found!");
+    ImGui::Spacing();
+    ImGui::Separator();
+  }
+
+  const ImVec2 next_window_position =
+      ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x + 20.f,
+             ImGui::GetWindowPos().y);
+
+  // Scroll instead of running off the screen, keeping Create Profile visible.
+  // The limit leaves room for the title bar above the list and the button
+  // below it, wherever the window is.
+  const ImGuiStyle& style = ImGui::GetStyle();
+  const float above_list_height =
+      ImGui::GetCursorScreenPos().y - ImGui::GetWindowPos().y;
+  const float reserved_height = style.ItemSpacing.y * 2.0f +
+                                ImGui::GetFrameHeightWithSpacing() +
+                                style.WindowPadding.y;
+  const float max_list_height =
+      std::max(viewport->WorkSize.y - above_list_height - reserved_height,
+               ui::default_image_icon_size.y * 1.5f);
+  ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f),
+                                      ImVec2(FLT_MAX, max_list_height));
+  ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, ImGui::GetFontSize() * 0.8f);
+  ImGui::BeginChild("##ProfileList", ImVec2(0.0f, 0.0f),
+                    ImGuiChildFlags_AutoResizeX | ImGuiChildFlags_AutoResizeY);
+  ImGui::PopStyleVar();
+
+  for (auto& [xuid, account] : *profiles) {
+    ImGui::PushID(fmt::format("{:016X}", xuid).c_str());
+
+    const uint8_t user_index =
+        profile_manager->GetUserIndexAssignedToProfile(xuid);
+
+    // Profile might be created after dialog was opened.
+    if (!profile_icon_.contains(xuid)) {
+      LoadProfileIcon(xuid);
+    }
+
+    const auto profile_icon = profile_icon_[xuid].get();
+
+    auto context_menu_fun = [=, this]() -> bool {
+      // Style the context menu like Xbox
+      const ImVec4 xbox_green(0.063f, 0.486f, 0.063f, 1.0f);
+      ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+      ImGui::PushStyleColor(ImGuiCol_Header, xbox_green);
+      ImGui::PushStyleColor(ImGuiCol_HeaderHovered, xbox_green);
+      ImGui::PushStyleColor(ImGuiCol_HeaderActive, xbox_green);
+      ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
+
+      if (ImGui::BeginPopupContextItem("Profile Menu")) {
+        context_menu_open_ = true;
+
+        // Handle B button to close context menu
+        if (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight) ||
+            ImGui::IsKeyPressed(ImGuiKey_GamepadBack)) {
+          ImGui::CloseCurrentPopup();
+          ImGui::EndPopup();
+          ImGui::PopStyleColor(6);
+          return true;
+        }
+
+        if (user_index == XUserIndexAny) {
+          if (ImGui::MenuItem("Login")) {
+            profile_manager->Login(xuid);
+            LoadProfileIcon(xuid);
+          }
+          if (ImGui::BeginMenu("Login to slot:")) {
+            for (uint8_t i = 1; i <= XUserMaxUserCount; i++) {
+              if (ImGui::MenuItem(fmt::format("slot {}", i).c_str())) {
+                uint64_t current_slot_xuid = 0;
+
+                if (const auto current_profile = profile_manager->GetProfile(
+                        static_cast<uint8_t>(i - 1));
+                    current_profile) {
+                  current_slot_xuid = current_profile->xuid();
+                }
+
+                profile_manager->Login(xuid, i - 1);
+                LoadProfileIcon(xuid);
+
+                // Release resources
+                if (current_slot_xuid) {
+                  LoadProfileIcon(current_slot_xuid);
+                }
+              }
+            }
+            ImGui::EndMenu();
+          }
+        } else {
+          if (ImGui::MenuItem("Logout")) {
+            profile_manager->Logout(user_index);
+            LoadProfileIcon(xuid);
+          }
+
+          ImGui::Separator();
+
+          auto account_live = account;
+          bool is_live = account_live.IsLiveEnabled();
+          if (ImGui::MenuItem("Live Enabled", nullptr, &is_live)) {
+            account_live.ToggleLiveFlag(is_live);
+            if (profile_manager->UpdateAccount(xuid, &account_live)) {
+              new ui::HostNotificationWindow(
+                  imgui_drawer(), "Xbox Live",
+                  is_live ? "Signed In" : "Signed Out", user_index);
+            }
+          }
+        }
+        ImGui::EndPopup();
+      }
+      ImGui::PopStyleColor(6);
+      return true;
+    };
+
+    if (!kernel::xam::xeDrawProfileContent(
+            imgui_drawer(), xuid, user_index, &account, profile_icon,
+            context_menu_fun, [=, this]() { LoadProfileIcon(xuid); },
+            &selected_xuid_)) {
+      ImGui::PopID();
+      ImGui::EndChild();
+      ImGui::PopStyleVar(1);
+      ImGui::PopStyleColor(14);
+      ImGui::End();
+      return;
+    }
+
+    ImGui::PopID();
+    ImGui::Separator();
+  }
+
+  ImGui::EndChild();
+
+  ImGui::Spacing();
+
+  if (ImGui::Button("Create Profile")) {
+    new kernel::xam::ui::CreateProfileUI(emulator_window_->imgui_drawer(),
+                                         emulator_window_->emulator());
+  }
+
+  ImGui::PopStyleVar(1);
+  ImGui::PopStyleColor(14);
+  ImGui::End();
+}
+
+}  // namespace app
+}  // namespace xe

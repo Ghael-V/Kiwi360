@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-FileCopyrightText: Copyright 2026 Kiwi360 Project -->
+<!-- SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0 -->
+<!-- The development build, told apart from the release one in the launcher. -->
+<resources>
+    <string name="app_name">Kiwi360 dev</string>
+</resources>
